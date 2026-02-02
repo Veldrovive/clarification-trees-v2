@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clarification_trees"
+version = "0.1.0"
+description = "Clarification Trees Research Project"
+authors = [
+  { name = "Aidan", email = "adempst@umich.edu" },
+]
+requires-python = ">=3.10"
+dependencies = [
+    "hydra-core",
+    "wandb",
+    "transformers",
+    "torch",
+    "torchvision",
+    "pillow",
+    "requests",
+    "tqdm",
+    "accelerate",
+    "pandas",
+]
+
+[project.scripts]
+download-data = "download_data:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

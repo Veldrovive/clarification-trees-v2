@@ -1,0 +1,29 @@
+# training:
+#   epochs: 5
+#   seed: 42
+#   device: 'cuda:7'
+#   batch_size: 1
+#   lr: 2e-4
+#   weight_decay: 0.01
+#   gradient_accumulation_steps: 10
+#   max_grad_norm: 1.0
+#   warmup_ratio: 0.03
+
+# dialog_tree:
+#   max_depth: 2
+#   question_expansion_factor: 2
+#   answer_expansion_factor: 1
+
+defaults:
+  - clarification_model: qwen_3_vl_8b_lora_small
+  - answer_model: qwen_3_vl_8b
+
+paths:
+  data:
+    clearvqa: /scratch4/home/adempst/projects/clarification-trees-v2/data/clearvqa
+  checkpoints:
+    loras: /scratch4/home/adempst/projects/clarification-trees-v2/checkpoints/loras
+
+runtime_meta:
+  git_commit: null
+  git_strict: true
