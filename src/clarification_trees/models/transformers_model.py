@@ -5,7 +5,7 @@ from pathlib import Path
 from omegaconf import DictConfig, OmegaConf
 from typing import Optional
 from transformers import BitsAndBytesConfig
-from peft import prepare_model_for_kbit_training, get_peft_model, LoraConfig
+from peft import prepare_model_for_kbit_training, get_peft_model, LoraConfig, PromptTuningConfig, TaskType, PromptTuningInit
 import peft
 import transformers
 from PIL import Image
@@ -104,14 +104,37 @@ class TransformersModel:
         print(f"Saving adapter to {adapter_save_dir}")
         self.adapted_model.save_pretrained(adapter_save_dir.absolute().as_posix())
 
-    def construct_new_adapter(self, lora_config: DictConfig) -> peft.PeftModel | peft.PeftMixedModel:
+    def construct_new_adapter(self, config: DictConfig, adapter_type: str = "lora") -> peft.PeftModel | peft.PeftMixedModel:
         """
-        Constructs a new LORA adapter from a config.
+        Constructs a new adapter (LoRA or Prompt Tuning) from a config.
         """
-        lora_model = prepare_model_for_kbit_training(self.base_model)
-        config_obj = LoraConfig(**OmegaConf.to_container(lora_config))
-        print(f"Adding LoRA to model with config: {config_obj}")
-        self.adapted_model = get_peft_model(lora_model, config_obj)
+        # prepare_model_for_kbit_training is generally useful for quantized base models, 
+        # but for prompt tuning on full precision it might not be strictly necessary. 
+        # However, keeping it consistent with the base model loading (often BNB) is safer.
+        model = prepare_model_for_kbit_training(self.base_model)
+        
+        container_config = OmegaConf.to_container(config, resolve=True)
+        
+        if adapter_type == "lora":
+            config_obj = LoraConfig(**container_config)
+            print(f"Adding LoRA to model with config: {config_obj}")
+        elif adapter_type == "prompt_tuning":
+            # Enum conversion for TaskType and PromptTuningInit if they are strings in the config
+            if "task_type" in container_config:
+                container_config["task_type"] = TaskType[container_config["task_type"]]
+            if "prompt_tuning_init" in container_config:
+                container_config["prompt_tuning_init"] = PromptTuningInit[container_config["prompt_tuning_init"]]
+                
+            config_obj = PromptTuningConfig(**container_config)
+            print(f"Adding Prompt Tuning to model with config: {config_obj}")
+        else:
+            raise ValueError(f"Unknown adapter type: {adapter_type}")
+
+        self.adapted_model = get_peft_model(model, config_obj)
+        # For prompt tuning, we need to make sure the adapter is trainable. 
+        # get_peft_model usually handles this, but explicit check helps debugging.
+        self.adapted_model.print_trainable_parameters()
+        
         return self.adapted_model
 
     ### GENERATION & DIALOG TREE ###
@@ -272,11 +295,13 @@ class TransformersModel:
 
     def generate(self, trajectory: DialogTrajectory, base_prompt_override: Optional[str] = None, use_base_model: bool = False, as_user: bool = False):
         inputs = self.preprocess_generation_inputs(trajectory, base_prompt_override, as_user)
-        if use_base_model or not self.model_config.lora_config.use_lora:
-            model = self.base_model
-        else:
-            assert self.adapted_model is not None, "Model does not have adapter loaded"
+        
+        # Use the adapted model (LoRA or Prompt Tuning) if available and not explicitly disabled
+        if not use_base_model and self.adapted_model is not None:
             model = self.adapted_model
+        else:
+            model = self.base_model
+            
         generated_ids = model.generate(**inputs, max_new_tokens=self.max_new_tokens)
         generated_ids_trimmed = [
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)

@@ -15,11 +15,12 @@
 #   answer_expansion_factor: 1
 
 devices:
-  clarification: 'cuda:5'
-  answer: 'cuda:6'
+  clarification: 'cuda:3'
+  answer: 'cuda:4'
 
 defaults:
   - clarification_model: qwen_3_vl_32b_lora_small
+  # - clarification_model: qwen_3_vl_32b_prompt_tune
   - answer_model: qwen_3_vl_32b
 
 paths:
