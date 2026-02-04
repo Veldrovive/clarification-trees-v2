@@ -14,9 +14,13 @@
 #   question_expansion_factor: 2
 #   answer_expansion_factor: 1
 
+devices:
+  clarification: 'cuda:5'
+  answer: 'cuda:6'
+
 defaults:
-  - clarification_model: qwen_3_vl_8b_lora_small
-  - answer_model: qwen_3_vl_8b
+  - clarification_model: qwen_3_vl_32b_lora_small
+  - answer_model: qwen_3_vl_32b
 
 paths:
   data:

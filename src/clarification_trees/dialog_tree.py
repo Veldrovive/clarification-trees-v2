@@ -16,6 +16,10 @@ class DialogNode:
         NodeType.CLARIFYING_ANSWER: "user",
         NodeType.INFERENCE: "assistant"
     }
+    reverse_role_map = {
+        "user": "assistant",
+        "assistant": "user"
+    }
 
     def __init__(self, node_type: NodeType, image: Optional[Image.Image], response: str):
         self.node_type = node_type
@@ -25,10 +29,11 @@ class DialogNode:
         self.model_name_to_message_generator = {
             "qwen-3-vl-2b": self._to_qwen_message,
             "qwen-3-vl-4b": self._to_qwen_message,
-            "qwen-3-vl-8b": self._to_qwen_message
+            "qwen-3-vl-8b": self._to_qwen_message,
+            "qwen-3-vl-32b": self._to_qwen_message,
         }
 
-    def _to_qwen_message(self):
+    def _to_qwen_message(self, reverse_roles: bool = False):
         content = []
         if self.image is not None:
             content.append({"type": "image", "image": self.image})
@@ -36,13 +41,17 @@ class DialogNode:
             content.append({"type": "text", "text": self.response})
         assert len(content) > 0, "DialogNode must have either an image or a response"
 
+        role = self.node_type_to_str[self.node_type]
+        if reverse_roles:
+            role = self.reverse_role_map[role]
+
         return {
-            "role": self.node_type_to_str[self.node_type],
+            "role": role,
             "content": content
         }
 
-    def to_message(self, model_name: str):
-        return self.model_name_to_message_generator[model_name]()
+    def to_message(self, model_name: str, reverse_roles: bool = False):
+        return self.model_name_to_message_generator[model_name](reverse_roles)
 
     def to_string(self):
         string = f"{self.node_type_to_str[self.node_type]}: {self.response}"
@@ -71,8 +80,8 @@ class DialogTrajectory:
             leaf_node_idx = parent_idx
         return trajectory
 
-    def to_messages(self, model_name: str):
-        return [node.to_message(model_name) for node in self.trajectory][::-1]
+    def to_messages(self, model_name: str, reverse_roles: bool = False):
+        return [node.to_message(model_name, reverse_roles) for node in self.trajectory][::-1]
 
     def to_string(self):
         string = f"Trajectory of length: {len(self.trajectory)}\n"
@@ -86,10 +95,20 @@ class DialogTrajectory:
 class DialogTree:
     ROOT = 0
 
-    def __init__(self, init_question: str, init_image: Image.Image, gold_answer: str | None = None, answers: List[str] | None = None):
+    def __init__(
+        self,
+        init_question: str, init_image: Image.Image, init_image_caption: str | None = None,
+        unambiguous_question: str | None = None,
+        gold_answer: str | None = None, answers: List[str] | None = None
+    ):
         # self.init_data = (-1, NodeType.ROOT, init_image, init_question)  # Parent index, Node type, Image, Question
         self.init_data = (-1, DialogNode(NodeType.ROOT, init_image, init_question))
         self.nodes = [self.init_data]
+
+        self.init_image_caption = init_image_caption
+        self.unambiguous_question = unambiguous_question
+        self.gold_answer = gold_answer
+        self.answers = answers
 
     def add_node(self, parent_idx: int, node_type: NodeType, image: Optional[Image.Image], response: str):
         self.nodes.append((parent_idx, DialogNode(node_type, image, response)))

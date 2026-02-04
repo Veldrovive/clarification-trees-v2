@@ -16,12 +16,31 @@ def load_clarification_model(_cfg: DictConfig):
     
     model = construct_model(
         model_config,
-        device="cuda",
+        device=_cfg.devices.clarification,
         load_lora=True,
         loras_path=lora_checkpoint_path,
     )
     assert model.adapted_model is not None, "No adapter is currently loaded or constructed."
     model.adapted_model.eval()
+
+    return model
+
+@st.cache_resource(show_spinner=True)
+def load_answer_model(_cfg: DictConfig):
+    """
+    Loads the answer model.
+    """
+    lora_checkpoint_path = Path(_cfg.paths.checkpoints.loras)
+    
+    model_config = _cfg.answer_model
+    
+    model = construct_model(
+        model_config,
+        device=_cfg.devices.answer,
+        load_lora=True,
+        loras_path=lora_checkpoint_path,
+    )
+    model.base_model.eval()
 
     return model
 

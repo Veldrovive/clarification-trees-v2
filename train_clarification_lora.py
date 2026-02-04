@@ -298,7 +298,7 @@ def construct_model_with_lora(model_config) -> TransformersModel:
     device = lora_training_config.device
 
     logger.info("Loading model...")
-    model = construct_model(model_config, device)
+    model = construct_model(model_config, device, load_lora=False)
     logger.info(f"Model loaded with memory footprint: {model.base_model.get_memory_footprint() / 1e9:.2f}GB")
 
     assert isinstance(model, TransformersModel), "Model must be a TransformersModel to train LORA"
@@ -334,9 +334,9 @@ def main(cfg: DictConfig):
     val_ds = ClearVQADataset(table_name="val_annotated.jsonl")
 
     # Aritifially limit the dataset to a small subset of samples
-    # from torch.utils.data import Subset
+    from torch.utils.data import Subset
     # train_ds = Subset(train_ds, range(100))
-    # val_ds = Subset(val_ds, range(100))
+    val_ds = Subset(val_ds, range(1000))
 
     train_loader = DataLoader(
         train_ds, 

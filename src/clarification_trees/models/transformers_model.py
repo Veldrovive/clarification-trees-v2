@@ -47,6 +47,10 @@ class TransformersModel:
             base_model, processor = self._load_qwen_vl_model(model_config, bnb_config)
         elif model_config.model_name == "qwen-3-vl-8b":
             base_model, processor = self._load_qwen_vl_model(model_config, bnb_config)
+        elif model_config.model_name == "qwen-3-vl-32b":
+            base_model, processor = self._load_qwen_vl_model(model_config, bnb_config)
+        elif model_config.model_name == "qwen-3-vl-235b":
+            base_model, processor = self._load_qwen_vl_model(model_config, bnb_config)
         else:
             raise NotImplementedError(f"Model {model_config.model_name} is not implemented")
 
@@ -163,26 +167,60 @@ class TransformersModel:
                             item["image"] = self._pad_and_resize_image(item["image"])
         return messages
 
-    def preprocess_generation_inputs(self, trajectory: DialogTrajectory, base_prompt_override: str | None = None):
-        messages = trajectory.to_messages(model_name=self.model_name)
+    def preprocess_generation_inputs(self, trajectory: DialogTrajectory, base_prompt_override: str | None = None, as_user: bool = False):
+        messages = trajectory.to_messages(model_name=self.model_name, reverse_roles=False)
         messages.insert(0, {"role": "system", "content": [{"type": "text", "text": base_prompt_override or self.model_config.base_prompt}]})
         messages = self._process_images_in_messages(messages)
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt"
-        )
+        if not as_user:
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt"
+            )
+        else:
+            # # Then we add a dummy message to the end that is empty and use the continue generation option
+            # messages.append({"role": "user", "content": [{"type": "text", "text": "Regarding your question, I am asking about "}]})
+            # inputs = self.processor.apply_chat_template(
+            #     messages,
+            #     tokenize=True,
+            #     add_generation_prompt=False,
+            #     continue_final_message=True,
+            #     return_dict=True,
+            #     return_tensors="pt"
+            # )
+            # Add system prompt specific to the User Persona
+            messages.insert(0, {"role": "system", "content": [{"type": "text", "text": base_prompt_override}]})
+            messages = self._process_images_in_messages(messages)
+            
+            # Instead of appending a User message and asking to complete it, 
+            # we append a User message creating a "Simulation Task" for the Assistant.
+            
+            # Current History: [User (Ambiguous), Assistant (Clarifying)]
+            
+            # We add a clear instruction for the model to generate the response
+            prompt_text = "Please write the response to the clarifying question above as if you were the user described in the system prompt. Reply directly with the clarification text only. Your text should start with something like 'Regarding your question, I am asking about ', 'Yes, ...' or 'No, ...'. Be short and concise."
+            messages.append({"role": "user", "content": [{"type": "text", "text": prompt_text}]})
+            
+            # Now the model generates an 'Assistant' turn, which contains the 'User's' text.
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True, # Standard generation
+                return_dict=True,
+                return_tensors="pt"
+            )
+        print(f"Generating using messages: {messages}")
         inputs = inputs.to(self.device)
         return inputs
 
-    def preprocess_training_inputs(self, trajectory: DialogTrajectory, base_prompt_override: str | None = None):
+    def preprocess_training_inputs(self, trajectory: DialogTrajectory, base_prompt_override: str | None = None, reverse_roles: bool = False):
         """
         Prepares inputs and labels for Causal LM training.
         The final message is the target while every message before it is context and has the label masked.
         """
-        messages = trajectory.to_messages(model_name=self.model_name)  # Get the list of dict context formatted correctly
+        messages = trajectory.to_messages(model_name=self.model_name, reverse_roles=reverse_roles)  # Get the list of dict context formatted correctly
 
         # Add system prompt
         messages.insert(0, {"role": "system", "content": [{"type": "text", "text": base_prompt_override or self.model_config.base_prompt}]})
@@ -232,9 +270,9 @@ class TransformersModel:
 
         return result
 
-    def generate(self, trajectory: DialogTrajectory, base_prompt_override: Optional[str] = None, use_base_model: bool = False):
-        inputs = self.preprocess_generation_inputs(trajectory, base_prompt_override)
-        if use_base_model:
+    def generate(self, trajectory: DialogTrajectory, base_prompt_override: Optional[str] = None, use_base_model: bool = False, as_user: bool = False):
+        inputs = self.preprocess_generation_inputs(trajectory, base_prompt_override, as_user)
+        if use_base_model or not self.model_config.lora_config.use_lora:
             model = self.base_model
         else:
             assert self.adapted_model is not None, "Model does not have adapter loaded"
