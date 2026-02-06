@@ -90,7 +90,7 @@ class TransformersModel:
         self.adapted_model = peft.PeftModel.from_pretrained(
             self.base_model,
             adapter_load_dir.absolute().as_posix(),
-            is_trainable=True
+            is_trainable=False
         )
         return self.adapted_model
 
@@ -223,7 +223,7 @@ class TransformersModel:
             # Current History: [User (Ambiguous), Assistant (Clarifying)]
             
             # We add a clear instruction for the model to generate the response
-            prompt_text = "Please write the response to the clarifying question above as if you were the user described in the system prompt. Reply directly with the clarification text only. Your text should start with something like 'Regarding your question, I am asking about ', 'Yes, ...' or 'No, ...'. Be short and concise."
+            prompt_text = "Please write the response to the clarifying question above as if you were the user described in the system prompt. Reply directly with the clarification text only. Your text should start with something like 'Regarding your question, I am asking about ', 'Yes, ...' or 'No, ...'. Be short and concise. Provide only the information asked for in the clarifying question and obscure the rest of the information as much as possible."
             messages.append({"role": "user", "content": [{"type": "text", "text": prompt_text}]})
             
             # Now the model generates an 'Assistant' turn, which contains the 'User's' text.
@@ -306,5 +306,51 @@ class TransformersModel:
         generated_ids_trimmed = [
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
+        generated_text = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)
+        return generated_text
+
+    def generate_diverse(self, trajectory: DialogTrajectory, num_samples: int, base_prompt_override: Optional[str] = None, use_base_model: bool = False, as_user: bool = False):
+        """
+        Generate multiple diverse responses for the same input.
+        """
+        inputs = self.preprocess_generation_inputs(trajectory, base_prompt_override, as_user)
+        
+        # Use the adapted model (LoRA or Prompt Tuning) if available and not explicitly disabled
+        if not use_base_model and self.adapted_model is not None:
+            model = self.adapted_model
+        else:
+            model = self.base_model
+
+        # generated_ids = model.generate(
+        #     **inputs,
+        #     num_beams=beam_multiplier * num_samples,             # Total beams
+        #     num_beam_groups=num_samples,        # Split into 5 groups
+        #     diversity_penalty=diversity_penalty,    # Penalty for using same tokens across groups
+        #     num_return_sequences=num_samples,   # Return the top result from each group
+        #     max_new_tokens=self.max_new_tokens,
+        #     trust_remote_code=True,
+        #     do_sample=False
+        # )
+        # generated_ids = model.generate(
+        #     **inputs,
+        #     max_new_tokens=self.max_new_tokens,
+        #     num_beams=num_samples * beam_multiplier,
+        #     num_beam_groups=num_samples,
+        #     num_return_sequences=num_samples,
+        #     diversity_penalty=diversity_penalty,
+        #     do_sample=False,
+        #     custom_generate="transformers-community/group-beam-search",
+        #     trust_remote_code=True,
+        # )
+        generated_ids = model.generate(
+            **inputs,
+            do_sample=True,           # Enable sampling
+            temperature=1.2,          # High temperature to encourage diverse answers
+            top_p=0.95,               # Nucleus sampling
+            top_k=50,                 # Limit sample pool to top 50 tokens
+            num_return_sequences=num_samples,   # Generate 5 different samples per prompt
+            max_new_tokens=self.max_new_tokens
+        )
+        generated_ids_trimmed = generated_ids[:, inputs.input_ids.shape[1]:]
         generated_text = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)
         return generated_text

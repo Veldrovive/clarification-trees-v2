@@ -19,8 +19,9 @@ devices:
   answer: 'cuda:4'
 
 defaults:
-  - clarification_model: qwen_3_vl_32b_lora_small
-  # - clarification_model: qwen_3_vl_32b_prompt_tune
+  # - clarification_model: qwen_3_vl_32b_lora_small
+  - clarification_model: qwen_3_vl_32b_prompt_tune
+  # - clarification_model: qwen_3_vl_8b_lora_no_quant
   - answer_model: qwen_3_vl_32b
 
 paths:

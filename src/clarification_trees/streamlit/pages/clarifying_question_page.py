@@ -44,6 +44,8 @@ def clarifying_question_page():
         st.session_state["cqp_sample_index"] = None
         st.session_state["cqp_dialog_tree"] = None
         st.session_state["cqp_dialog_tree_leaf"] = None
+
+        st.session_state["cqp_diverse_predictions"] = None
         
         print("Switched to clarifying question page")
 
@@ -59,6 +61,14 @@ def clarifying_question_page():
         # Button to trigger the modal
         if st.button("Upload Custom"):
             show_custom_input_modal()
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        produce_diverse_outputs = st.checkbox("Produce Diverse Outputs", value=False)
+        if not produce_diverse_outputs:
+            st.session_state["cqp_diverse_predictions"] = None
+    with col2:
+        num_diverse_outputs = st.number_input("Number of Diverse Outputs", min_value=2, max_value=20, value=5, disabled=not produce_diverse_outputs)
 
     if selected_index != st.session_state["cqp_sample_index"]:
         # If the user touches the number input, this condition becomes True
@@ -115,8 +125,24 @@ Constraints:
 2. Include only minimal information to help the assistant. You are training the assistant to ask good questions.
 3. CRITICAL: Do NOT simply state the answer to the unambiguous question (e.g., do not say the number, name, or specific value).
 4. Only describe the location, color, or type of object you are interested in.
+5. Answer vague questions with vague answers. Provide only the information that was asked for.
 
-Context:
+Examples:
+Image - A bowl of fruit on a table with a red apple on the left, a green apple on the right, a banana, and an orange.
+Unambiguous Question - "What color is the apple on the right"
+Ambiguous Question - "What color is it?"
+Allowed Answers - ["green"]
+
+Clarifying Question - "Are you talking about an apple"
+Good Answer - "Yes"
+Bad Answer - "Yes, the apple on the right"
+Additional information is witheld.
+
+Clarifying Question - "Are you talking about the apple on the left"
+Good Answer - "No" or "No, I am talking about the apple on the right"
+Question is asking about location, so location can be included in the answer.
+
+Current Context:
 Allowed Answers: {dialog_tree.answers}
 
 Given next is the full conversation:
@@ -128,6 +154,9 @@ Given next is the full conversation:
             # All Answers: {dialog_tree.answers}
             with st.spinner("Generating answer"):
                 prediction = answer_model.generate(dialog_trajectory, base_prompt_override=full_system_prompt, as_user=True)
+                if produce_diverse_outputs:
+                    diverse_predictions = answer_model.generate_diverse(dialog_trajectory, num_samples=num_diverse_outputs, base_prompt_override=full_system_prompt, as_user=True)
+                    st.session_state["cqp_diverse_predictions"] = diverse_predictions
 
             ca = dialog_tree.add_node(dialog_tree_leaf, NodeType.CLARIFYING_ANSWER, None, prediction[0])
             st.session_state["cqp_dialog_tree_leaf"] = ca
@@ -136,6 +165,9 @@ Given next is the full conversation:
             print(f"Last node type: {dialog_trajectory.trajectory[0].node_type}. Generating clarifying question to question {dialog_trajectory.trajectory[0].response}")
             with st.spinner("Generating clarifying question"):
                 prediction = clarification_model.generate(dialog_trajectory)
+                if produce_diverse_outputs:
+                    diverse_predictions = clarification_model.generate_diverse(dialog_trajectory, num_samples=num_diverse_outputs)
+                    st.session_state["cqp_diverse_predictions"] = diverse_predictions
             cq = dialog_tree.add_node(dialog_tree_leaf, NodeType.CLARIFICATION_QUESTION, None, prediction[0])
             st.session_state["cqp_dialog_tree_leaf"] = cq
             st.rerun()
@@ -150,3 +182,7 @@ Given next is the full conversation:
             cq = dialog_tree.add_node(dialog_tree_leaf, NodeType.CLARIFICATION_QUESTION, None, user_response)
             st.session_state["cqp_dialog_tree_leaf"] = cq
             st.rerun()
+
+    if "cqp_diverse_predictions" in st.session_state and st.session_state["cqp_diverse_predictions"] is not None:
+        with st.expander("Diverse Predictions"):
+            st.write(st.session_state["cqp_diverse_predictions"])
