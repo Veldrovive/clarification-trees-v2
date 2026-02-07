@@ -160,9 +160,9 @@ class BidirectionalEntailmentClusterer(Clusterer):
         a_entails_b = scores[0][self.entailment_label_index] >= self.similarity_threshold
         b_entails_a = scores[1][self.entailment_label_index] >= self.similarity_threshold
 
-        print(f"Checking bidirectional entailment for: {text_a} and {text_b}")
-        print(f"A entails B: {a_entails_b} ({scores[0][self.entailment_label_index]})")
-        print(f"B entails A: {b_entails_a} ({scores[1][self.entailment_label_index]})")
+        # print(f"Checking bidirectional entailment for: {text_a} and {text_b}")
+        # print(f"A entails B: {a_entails_b} ({scores[0][self.entailment_label_index]})")
+        # print(f"B entails A: {b_entails_a} ({scores[1][self.entailment_label_index]})")
         
         return a_entails_b and b_entails_a
         
@@ -452,29 +452,29 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Running on device: {device}\n")
 
-    # # 1. Run Semantic Clustering (Embedding Based)
-    # print("--- Running Semantic Clusterer (Embeddings) ---")
-    # sem_clusterer = SemanticClusterer(semantic_cfg, device)
-    # s_clusters, s_exemplars = sem_clusterer.cluster(test_texts)
+    # 1. Run Semantic Clustering (Embedding Based)
+    print("--- Running Semantic Clusterer (Embeddings) ---")
+    sem_clusterer = SemanticClusterer(semantic_cfg, device)
+    s_clusters, s_exemplars = sem_clusterer.cluster(test_texts)
     
-    # for i, (cluster, center) in enumerate(zip(s_clusters, s_exemplars)):
-    #     print(f"Cluster {i+1} [Center: '{center}']: {cluster}")
+    for i, (cluster, center) in enumerate(zip(s_clusters, s_exemplars)):
+        print(f"Cluster {i+1} [Center: '{center}']: {cluster}")
 
-    # print("\n" + "="*50 + "\n")
+    print("\n" + "="*50 + "\n")
 
-    # # 2. Run Entailment Clustering (Logic Based)
-    # print("--- Running Entailment Clusterer (Logic/NLI) ---")
-    # # Note: Entailment is slower but stricter. 
-    # # It should correctly separate "The sky is blue" from "The ocean is blue" 
-    # # even if embeddings think they are similar.
-    # ent_clusterer = BidirectionalEntailmentClusterer(entailment_cfg, device)
-    # e_clusters, e_exemplars = ent_clusterer.cluster(test_texts)
+    # 2. Run Entailment Clustering (Logic Based)
+    print("--- Running Entailment Clusterer (Logic/NLI) ---")
+    # Note: Entailment is slower but stricter. 
+    # It should correctly separate "The sky is blue" from "The ocean is blue" 
+    # even if embeddings think they are similar.
+    ent_clusterer = BidirectionalEntailmentClusterer(entailment_cfg, device)
+    e_clusters, e_exemplars = ent_clusterer.cluster(test_texts)
     
-    # for i, (cluster, center) in enumerate(zip(e_clusters, e_exemplars)):
-    #     print(f"Cluster {i+1} [Center: '{center}']: {cluster}")
+    for i, (cluster, center) in enumerate(zip(e_clusters, e_exemplars)):
+        print(f"Cluster {i+1} [Center: '{center}']: {cluster}")
 
 
-    # print("\n" + "="*50 + "\n")
+    print("\n" + "="*50 + "\n")
 
     # 3. Run Hybrid Clustering (Embeddings + NLI)
     print("--- Running Hybrid Clusterer (Embeddings + NLI) ---")

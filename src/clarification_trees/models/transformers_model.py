@@ -61,22 +61,27 @@ class TransformersModel:
             from transformers import Qwen3VLForConditionalGeneration
         except ImportError:
             raise ImportError("Qwen3VLForConditionalGeneration is not available. Please install transformers.")
+
+        if bnb_config is not None:
+            print(f"Loading model with BNB config: {bnb_config}")
+        else:
+            print("Loading model without BNB config")
         
-        desired_dtype = model_config.torch_dtype if "torch_dtype" in model_config else torch.bfloat16
+        desired_dtype = model_config.torch_dtype if "torch_dtype" in model_config else "auto"
         if model_config.use_flash_attention:
             model = Qwen3VLForConditionalGeneration.from_pretrained(
                 model_config.model_hf_transformers_key,
                 dtype=desired_dtype,
                 attn_implementation="flash_attention_2",
                 device_map=self.device,
-                quantization_config=self.bnb_config
+                quantization_config=bnb_config
             )
         else:
             model = Qwen3VLForConditionalGeneration.from_pretrained(
                 model_config.model_hf_transformers_key,
                 dtype=desired_dtype,
                 device_map=self.device,
-                quantization_config=self.bnb_config
+                quantization_config=bnb_config
             )
         processor = AutoProcessor.from_pretrained(model_config.model_hf_transformers_key)
 
@@ -224,7 +229,7 @@ class TransformersModel:
             # Current History: [User (Ambiguous), Assistant (Clarifying)]
             
             # We add a clear instruction for the model to generate the response
-            prompt_text = "Please write the response to the clarifying question above as if you were the user described in the system prompt. Reply directly with the clarification text only. Your text should start with something like 'Regarding your question, I am asking about ', 'Yes, ...' or 'No, ...'. Be short and concise. Provide only the information asked for in the clarifying question and obscure the rest of the information as much as possible."
+            prompt_text = "Please write the response to the clarifying question above as if you were the user described in the system prompt. Reply directly with the clarification text only. Your text should start with something like 'Regarding your question, I am asking about ', 'Yes, ...' or 'No, ...'. Be short and concise. Provide only the information asked for in the clarifying question and obscure the rest of the information as much as possible. Use only words that do not appear in the final answer."
             messages.append({"role": "user", "content": [{"type": "text", "text": prompt_text}]})
             
             # Now the model generates an 'Assistant' turn, which contains the 'User's' text.

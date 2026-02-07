@@ -157,6 +157,7 @@ Given next is the full conversation:
             # All Answers: {dialog_tree.answers}
             with st.spinner("Generating answer"):
                 prediction = answer_model.generate(dialog_trajectory, base_prompt_override=full_system_prompt, as_user=True)
+                print(f"Generated answer: {prediction}")
                 if produce_diverse_outputs:
                     diverse_predictions = answer_model.generate_diverse(dialog_trajectory, num_samples=num_diverse_outputs, base_prompt_override=full_system_prompt, as_user=True)
                     clustered_diverse_predictions, diverse_semantic_centers = semantic_clusterer.cluster(diverse_predictions)
