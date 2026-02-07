@@ -2,6 +2,7 @@ from omegaconf import DictConfig
 from pathlib import Path
 
 from .transformers_model import TransformersModel
+from .semantic_clustering import SemanticClusterer
 
 def construct_model(model_config: DictConfig, device: str, load_lora: bool = True, loras_path: Path | None = None) -> TransformersModel:
     """
@@ -29,3 +30,12 @@ def construct_model(model_config: DictConfig, device: str, load_lora: bool = Tru
         else:
             print(f"WARNING: No Adapter (LoRA or Prompt Tuning) enabled for model {model_config.model_name}")
     return model
+
+def construct_semantic_clusterer(semantic_cluster_config: DictConfig, device: str) -> SemanticClusterer:
+    """
+    Construct a SemanticClusterer from the given config.
+    """
+    if semantic_cluster_config.model_type == "sentence_transformers":
+        return SemanticClusterer(semantic_cluster_config, device)
+    else:
+        raise NotImplementedError(f"Model type {semantic_cluster_config.model_type} is not implemented for semantic clustering")

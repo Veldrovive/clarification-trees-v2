@@ -62,10 +62,11 @@ class TransformersModel:
         except ImportError:
             raise ImportError("Qwen3VLForConditionalGeneration is not available. Please install transformers.")
         
+        desired_dtype = model_config.torch_dtype if "torch_dtype" in model_config else torch.bfloat16
         if model_config.use_flash_attention:
             model = Qwen3VLForConditionalGeneration.from_pretrained(
                 model_config.model_hf_transformers_key,
-                dtype=torch.bfloat16,
+                dtype=desired_dtype,
                 attn_implementation="flash_attention_2",
                 device_map=self.device,
                 quantization_config=self.bnb_config
@@ -73,7 +74,7 @@ class TransformersModel:
         else:
             model = Qwen3VLForConditionalGeneration.from_pretrained(
                 model_config.model_hf_transformers_key,
-                dtype="auto",
+                dtype=desired_dtype,
                 device_map=self.device,
                 quantization_config=self.bnb_config
             )

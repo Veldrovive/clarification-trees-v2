@@ -7,7 +7,7 @@ Allows user to create answers to the clarifying questions and then has the model
 import streamlit as st
 from PIL import Image
 
-from clarification_trees.streamlit.utils import load_clarification_model, load_answer_model, load_clearvqa_dataset
+from clarification_trees.streamlit.utils import load_clarification_model, load_answer_model, load_semantic_clusterer, load_clearvqa_dataset
 from clarification_trees.streamlit.components import dialog_trajectory_component
 from clarification_trees.dialog_tree import DialogTree, NodeType
 
@@ -46,6 +46,7 @@ def clarifying_question_page():
         st.session_state["cqp_dialog_tree_leaf"] = None
 
         st.session_state["cqp_diverse_predictions"] = None
+        st.session_state["cqp_diverse_semantic_centers"] = None
         
         print("Switched to clarifying question page")
 
@@ -67,6 +68,7 @@ def clarifying_question_page():
         produce_diverse_outputs = st.checkbox("Produce Diverse Outputs", value=False)
         if not produce_diverse_outputs:
             st.session_state["cqp_diverse_predictions"] = None
+            st.session_state["cqp_diverse_semantic_centers"] = None
     with col2:
         num_diverse_outputs = st.number_input("Number of Diverse Outputs", min_value=2, max_value=20, value=5, disabled=not produce_diverse_outputs)
 
@@ -108,6 +110,7 @@ def clarifying_question_page():
 
     clarification_model = load_clarification_model(cfg)
     answer_model = load_answer_model(cfg)
+    semantic_clusterer = load_semantic_clusterer(cfg)
     # st.write(model)
     # if dialog_trajectory.trajectory[0].node_type != NodeType.CLARIFICATION_QUESTION:
     if generate:
@@ -156,7 +159,9 @@ Given next is the full conversation:
                 prediction = answer_model.generate(dialog_trajectory, base_prompt_override=full_system_prompt, as_user=True)
                 if produce_diverse_outputs:
                     diverse_predictions = answer_model.generate_diverse(dialog_trajectory, num_samples=num_diverse_outputs, base_prompt_override=full_system_prompt, as_user=True)
-                    st.session_state["cqp_diverse_predictions"] = diverse_predictions
+                    clustered_diverse_predictions, diverse_semantic_centers = semantic_clusterer.cluster(diverse_predictions)
+                    st.session_state["cqp_diverse_predictions"] = clustered_diverse_predictions
+                    st.session_state["cqp_diverse_semantic_centers"] = diverse_semantic_centers
 
             ca = dialog_tree.add_node(dialog_tree_leaf, NodeType.CLARIFYING_ANSWER, None, prediction[0])
             st.session_state["cqp_dialog_tree_leaf"] = ca
@@ -167,7 +172,9 @@ Given next is the full conversation:
                 prediction = clarification_model.generate(dialog_trajectory)
                 if produce_diverse_outputs:
                     diverse_predictions = clarification_model.generate_diverse(dialog_trajectory, num_samples=num_diverse_outputs)
-                    st.session_state["cqp_diverse_predictions"] = diverse_predictions
+                    clustered_diverse_predictions, diverse_semantic_centers = semantic_clusterer.cluster(diverse_predictions)
+                    st.session_state["cqp_diverse_predictions"] = clustered_diverse_predictions
+                    st.session_state["cqp_diverse_semantic_centers"] = diverse_semantic_centers
             cq = dialog_tree.add_node(dialog_tree_leaf, NodeType.CLARIFICATION_QUESTION, None, prediction[0])
             st.session_state["cqp_dialog_tree_leaf"] = cq
             st.rerun()
@@ -183,6 +190,9 @@ Given next is the full conversation:
             st.session_state["cqp_dialog_tree_leaf"] = cq
             st.rerun()
 
+    if "cqp_diverse_semantic_centers" in st.session_state and st.session_state["cqp_diverse_semantic_centers"] is not None:
+        with st.expander("Diverse Semantic Centers"):
+            st.write(st.session_state["cqp_diverse_semantic_centers"])
     if "cqp_diverse_predictions" in st.session_state and st.session_state["cqp_diverse_predictions"] is not None:
         with st.expander("Diverse Predictions"):
             st.write(st.session_state["cqp_diverse_predictions"])

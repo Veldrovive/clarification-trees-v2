@@ -2,7 +2,7 @@ from omegaconf import DictConfig
 import streamlit as st
 from pathlib import Path
 
-from clarification_trees.models import construct_model
+from clarification_trees.models import construct_model, construct_semantic_clusterer
 from clarification_trees.dataset import ClearVQADataset
 
 @st.cache_resource(show_spinner=True)
@@ -42,6 +42,19 @@ def load_answer_model(_cfg: DictConfig):
     )
     model.base_model.eval()
 
+    return model
+
+@st.cache_resource(show_spinner=True)
+def load_semantic_clusterer(_cfg: DictConfig):
+    """
+    Loads the semantic clusterer.
+    """
+    model_config = _cfg.semantic_cluster_model
+    
+    model = construct_semantic_clusterer(
+        model_config,
+        device=_cfg.devices.semantic_cluster,
+    )
     return model
 
 @st.cache_resource
