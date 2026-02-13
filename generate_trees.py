@@ -29,48 +29,6 @@ from clarification_trees.models import Clusterer, construct_semantic_clusterer
 from clarification_trees.dataset import ClearVQADataset
 from clarification_trees.utils import set_seed, add_cq_messages, add_answer_messages
 
-# def init_models(cfg: DictConfig):
-#     lora_checkpoint_path = Path(cfg.paths.checkpoints.loras)
-
-#     cq_model_cfg = OmegaConf.to_container(cfg['clarification_model'])
-#     answer_model_cfg = OmegaConf.to_container(cfg['answer_model'])
-#     clusterer_cfg = cfg['semantic_cluster_model']
-
-#     cq_model_gpus = cfg.devices.clarification  # Like "3" or "2,3"
-#     cq_model_num_gpus = cq_model_gpus.count(",") + 1
-#     answer_model_gpus = cfg.devices.answer
-#     answer_model_num_gpus = answer_model_gpus.count(",") + 1
-#     clusterer_gpus = cfg.devices.semantic_cluster
-
-#     print("Loading models...")
-#     print(f"  Clarification model on {cq_model_num_gpus} GPUs ({cq_model_gpus})")
-#     print(f"  Answer model on {answer_model_num_gpus} GPUs ({answer_model_gpus})")
-#     print(f"  Clusterer on {clusterer_gpus}")
-    
-#     clusterer = construct_semantic_clusterer(clusterer_cfg, clusterer_gpus)
-
-#     cq_model_processor = QwenModelInputProcessor(cq_model_cfg)
-#     answer_model_processor = QwenModelInputProcessor(answer_model_cfg)
-
-#     os.environ["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"  # Necessary to prevent Ray from overriding CUDA_VISIBLE_DEVICES to empty
-    
-#     cq_model = CQModelWorker.options( 
-#         runtime_env={"env_vars": {"CUDA_VISIBLE_DEVICES": cq_model_gpus}},
-#         num_gpus=0  # 0 so that we do not get conflicts with vLLM trying to auto-assign GPUs
-#     ).remote(cq_model_cfg, lora_checkpoint_path, n_gpus=cq_model_num_gpus)
-    
-#     answer_model = GenericModelWorker.options(
-#         runtime_env={"env_vars": {"CUDA_VISIBLE_DEVICES": answer_model_gpus}},
-#         num_gpus=0  # 0 so that we do not get conflicts with vLLM trying to auto-assign GPUs
-#     ).remote(answer_model_cfg, lora_checkpoint_path, n_gpus=answer_model_num_gpus)
-
-#     cq_future = cq_model.ping.remote() 
-#     ans_future = answer_model.ping.remote()
-
-#     ray.get([cq_future, ans_future])
-    
-#     return clusterer, cq_model, answer_model, cq_model_processor, answer_model_processor
-
 @asynccontextmanager
 async def use_models(cfg: DictConfig):
     lora_checkpoint_path = Path(cfg.paths.checkpoints.loras)
@@ -190,16 +148,6 @@ class DialogTreeDFSManager:
         
         return new_node_ids
 
-
-# async def expand_tree(
-#     cfg: DictConfig,
-#     tree: DialogTree,
-#     clusterer: Clusterer,
-#     cq_model,
-#     answer_model,
-#     cq_processor: QwenModelInputProcessor,
-#     answer_processor: QwenModelInputProcessor,
-# ):
 async def expand_tree(
     cfg: DictConfig,
     tree: DialogTree,
@@ -448,60 +396,6 @@ def main(cfg: DictConfig):
         # ds = Subset(ds, range(500))
 
         asyncio.run(run_expand_trees(cfg, ds, out_path, n_parallel_trees=N_parallel_trees))
-
-    # # Construct tree roots using the train set of ClearVQA
-    # ds = ClearVQADataset(load_images=False)
-    # test_tree = DialogTree(
-    #     init_question=ds[0][1]["blurred_question"],
-    #     init_image=ds[0][0],
-    #     init_image_path=
-    #     unambiguous_question=ds[0][1]["question"],
-    #     gold_answer=ds[0][1]["gold_answer"],
-    #     answers=ds[0][1]["answers"]
-    # )
-
-    # from torch.utils.data import Subset
-    # ds = Subset(ds, range(500))
-    
-
-    # # clusterer, cq_model, answer_model, cq_model_processor, answer_model_processor = init_models(cfg)
-    # clusterer, remote_cq_model = init_models(cfg)
-
-    # # asyncio.run(
-    # #     expand_tree(
-    # #         cfg=cfg,
-    # #         tree=test_tree,
-    # #         clusterer=clusterer,
-    # #         cq_model=cq_model,
-    # #         answer_model=answer_model,
-    # #         cq_processor=cq_model_processor,
-    # #         answer_processor=answer_model_processor
-    # #     )
-    # # )
-
-    # N_parallel_trees = 100
-    # asyncio.run(
-    #     # process_dataset_lazily(
-    #     #     cfg,
-    #     #     ds,
-    #     #     clusterer,
-    #     #     cq_model,
-    #     #     answer_model,
-    #     #     cq_model_processor,
-    #     #     answer_model_processor,
-    #     #     N_parallel_trees,
-    #     #     out_dir=out_path
-    #     # )
-    #     process_dataset_lazily(
-    #         cfg,
-    #         ds,
-    #         clusterer,
-    #         remote_cq_model,
-    #         N_parallel_trees,
-    #         out_dir=out_path
-    #     )
-    # )
-    
 
 
 if __name__ == "__main__":

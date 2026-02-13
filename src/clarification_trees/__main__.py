@@ -10,7 +10,7 @@ load_dotenv()
 
 from clarification_trees.dialog_tree import DialogTree, NodeType
 from clarification_trees.dataset import ClearVQADataset
-from clarification_trees.utils import add_cq_messages, add_answer_messages, add_inference_messages
+from clarification_trees.utils import add_cq_messages, add_answer_messages, add_inference_messages, get_judge_messages, processes_judge_response
 from src.clarification_trees.models.vllm.remote_vllm_model import RemoteVLLMModel
 
 app = typer.Typer()
@@ -156,6 +156,37 @@ def test_vllm_server(
 
                 clarification_input_node = DialogTree.ROOT
 
+                async def _generate_inference_and_scores(tree: DialogTree, clarification_input_node: int):
+                    dialog_traj = tree.get_trajectory(clarification_input_node)
+                    messages = dialog_traj.to_messages("qwen-3-vl", use_img_path=True)
+                    add_inference_messages(messages, cfg=cfg)
+                    inference_response_obj = await answer_model.generate(messages, use_lora=False)
+                    inference_response = inference_response_obj.choices[0].message.content
+                    assert inference_response is not None
+                    print(typer.style("\n>> Inference Response:", fg=typer.colors.BRIGHT_GREEN, bold=True))
+                    print(">> " + inference_response)
+                    tree.add_node(clarification_input_node, NodeType.INFERENCE, inference_response)
+
+                    # Get scores
+                    messages = get_judge_messages(
+                        unambiguous_question=sample.question,
+                        gold_answer=sample.gold_answer,
+                        answers=sample.answers,
+                        caption=sample.caption,
+                        inference_response=inference_response,
+                        cfg=cfg
+                    )
+                    scores_response_obj = await answer_model.generate(messages, use_lora=False)
+                    scores_response = scores_response_obj.choices[0].message.content
+                    assert scores_response is not None
+                    reasoning, score = processes_judge_response(scores_response)
+                    print(typer.style("\n>> Scores:", fg=typer.colors.BRIGHT_GREEN, bold=True))
+                    print(f">> Reasoning: {reasoning}")
+                    print(f">> Score: {score}")
+
+                # Immediately try to get an inference
+                await _generate_inference_and_scores(tree, clarification_input_node)
+
                 for _ in range(5):
                     # Get a clarifying question from the clarification model
                     dialog_traj = tree.get_trajectory(clarification_input_node)
@@ -183,18 +214,20 @@ def test_vllm_server(
                     print(answer_response)
                     clarification_input_node = tree.add_node(answer_input_node, NodeType.CLARIFYING_ANSWER, answer_response)
 
-                    # Get an inference from the answer model
-                    dialog_traj = tree.get_trajectory(clarification_input_node)
-                    messages = dialog_traj.to_messages("qwen-3-vl", use_img_path=True)
-                    add_inference_messages(messages, cfg=cfg)
-                    # print(f"Testing answer model with messages:\n{messages}")
+                    # # Get an inference from the answer model
+                    # dialog_traj = tree.get_trajectory(clarification_input_node)
+                    # messages = dialog_traj.to_messages("qwen-3-vl", use_img_path=True)
+                    # add_inference_messages(messages, cfg=cfg)
+                    # # print(f"Testing answer model with messages:\n{messages}")
 
-                    inference_response_obj = await answer_model.generate(messages, use_lora=False)
-                    inference_response = inference_response_obj.choices[0].message.content
-                    assert inference_response is not None
-                    print(typer.style("\n>> Inference Response:", fg=typer.colors.BRIGHT_GREEN, bold=True))
-                    print(">> " + inference_response)
-                    tree.add_node(clarification_input_node, NodeType.INFERENCE, inference_response)
+                    # inference_response_obj = await answer_model.generate(messages, use_lora=False)
+                    # inference_response = inference_response_obj.choices[0].message.content
+                    # assert inference_response is not None
+                    # print(typer.style("\n>> Inference Response:", fg=typer.colors.BRIGHT_GREEN, bold=True))
+                    # print(">> " + inference_response)
+                    # tree.add_node(clarification_input_node, NodeType.INFERENCE, inference_response)
+
+                    await _generate_inference_and_scores(tree, clarification_input_node)
 
                 
 

@@ -6,6 +6,8 @@ import logging
 import subprocess
 import numpy as np
 import torch
+import re
+from typing import Any
 
 def get_git_commit(short=True):
     """
@@ -160,3 +162,47 @@ def add_inference_messages(messages: list[dict], cfg: DictConfig | None = None, 
     messages.append({"role": "user", "content": [{"type": "text", "text": instruction_prompt}]})
     return messages
         
+def get_judge_messages(
+    unambiguous_question: str,
+    gold_answer: str,
+    answers: list[str],
+    caption: str,
+    inference_response: str,
+    cfg: DictConfig | None = None, model_cfg: DictConfig | None = None
+) -> list[dict]:
+    assert cfg is None or model_cfg is None, "Only one of cfg or model_cfg can be provided"
+
+    prompt_fills = {
+        "unambiguous_question": unambiguous_question,
+        "gold_answer": gold_answer,
+        "answers": answers,
+        "caption": caption,
+        "inference_response": inference_response,
+    }
+
+    if cfg is not None:
+        system_prompt = cfg.answer_model.judge_prompts.base_prompt.format(**prompt_fills)
+        instruction_prompt = cfg.answer_model.judge_prompts.instruction_prompt.format(**prompt_fills)
+    elif model_cfg is not None:
+        system_prompt = model_cfg.judge_prompts.base_prompt.format(**prompt_fills)
+        instruction_prompt = model_cfg.judge_prompts.instruction_prompt.format(**prompt_fills)
+    else:
+        raise ValueError("Either cfg or model_cfg must be provided")
+
+    formatted_system_prompt = system_prompt.format(unambiguous_question=unambiguous_question, gold_answer=gold_answer, answers=answers, caption=caption, inference_response=inference_response)
+
+    messages = []
+    messages.append({"role": "system", "content": [{"type": "text", "text": formatted_system_prompt}]})
+    messages.append({"role": "user", "content": [{"type": "text", "text": instruction_prompt}]})
+    return messages
+
+def processes_judge_response(response: str) -> tuple[str, int]:
+    # Extract reasoning
+    reasoning_match = re.search(r"Reasoning:\s*(.*?)(?=\nScore:|$)", response, re.IGNORECASE | re.DOTALL)
+    reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
+
+    # Extract score
+    score_match = re.search(r"Score:\s*(\d+)", response, re.IGNORECASE)
+    score = int(score_match.group(1)) if score_match else -1
+
+    return reasoning, score
