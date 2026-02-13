@@ -16,24 +16,26 @@ from omegaconf import DictConfig, OmegaConf
 from clarification_trees.models import TransformersModel, construct_model
 from clarification_trees.dialog_tree import DialogTree, NodeType
 from clarification_trees.utils import set_seed
-from clarification_trees.dataset import ClearVQADataset
+from clarification_trees.dataset import ClearVQADataset, ClearVQASample
 
 from logging import getLogger
 logger = getLogger(Path(__file__).name)
 
 def get_collate_fn(model: TransformersModel):
-    def clarification_sample_collate(batch):
+    def clarification_sample_collate(batch: list[ClearVQASample]):
         processed_samples = []
         
         for sample in batch:
-            image = sample[0]
-            ambiguous_question = sample[1]["blurred_question"]
-            clarifying_question = sample[1]["clarification_question"]
+            image = sample.image
+            assert image is not None, "ClearVQADataset was created without image loading enabled."
+            ambiguous_question = sample.blurred_question
+            clarifying_question = sample.clarification_question
+            image_path = sample.image_path
             
             # Construct tree to get the trajectory
-            tree = DialogTree(ambiguous_question, image)
+            tree = DialogTree(ambiguous_question, image, image_path)
             # Add the target node (Assistant's response)
-            cq = tree.add_node(DialogTree.ROOT, NodeType.CLARIFICATION_QUESTION, None, clarifying_question)
+            cq = tree.add_node(DialogTree.ROOT, NodeType.CLARIFICATION_QUESTION, clarifying_question)
             
             # Get trajectory specifically ending at the target
             trajectory = tree.get_trajectory(cq)
@@ -56,7 +58,7 @@ def get_collate_fn(model: TransformersModel):
         pixel_values = torch.stack([s["pixel_values"] for s in processed_samples])
         grid_thw = torch.stack([s["image_grid_thw"] for s in processed_samples])
 
-        batch = {
+        processed_batch = {
             "input_ids": input_ids_padded,  # (batch_size, max_seq_length)
             "labels": labels_padded,  # (batch_size, max_seq_length). -100 masks out labels that are not part of the target
             "attention_mask": attention_mask_padded,  # (batch_size, max_seq_length)
@@ -64,7 +66,7 @@ def get_collate_fn(model: TransformersModel):
             "image_grid_thw": grid_thw  # (batch_size, 3)
         }
 
-        return batch
+        return processed_batch
 
     return clarification_sample_collate
 
@@ -120,17 +122,19 @@ def generate_samples(model: TransformersModel, val_loader: DataLoader, device: s
     columns = ["Image Index", "Image", "Question Id", "Ambiguous Question", "Ground Truth CQ", "Model Prediction", "Answer"]
 
     with torch.no_grad():
-        vqa_dataset = val_loader.dataset
+        assert isinstance(val_loader.dataset, ClearVQADataset), "Dataset is not a ClearVQADataset"
+        vqa_dataset: ClearVQADataset = val_loader.dataset
         progress = tqdm(range(min(n_samples, len(vqa_dataset))), desc="Generating Samples")
         for i in progress:
             sample = vqa_dataset[i]
-            image = sample[0]
-            ambiguous_q = sample[1]["blurred_question"]
-            gt_clarification = sample[1]["clarification_question"]
-            question_id = sample[1]["question_id"]
-            answer = sample[1]["gold_answer"]
+            image = sample.image
+            assert image is not None, "ClearVQADataset was created without image loading enabled."
+            ambiguous_q = sample.blurred_question
+            gt_clarification = sample.clarification_question
+            question_id = sample.question_id
+            answer = sample.gold_answer
 
-            tree = DialogTree(ambiguous_q, image)
+            tree = DialogTree(ambiguous_q, image, sample.image_path)
             trajectory = tree.get_trajectory(DialogTree.ROOT)
 
             prediction = model.generate(trajectory)

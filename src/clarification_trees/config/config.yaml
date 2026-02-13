@@ -9,18 +9,29 @@
 #   max_grad_norm: 1.0
 #   warmup_ratio: 0.03
 
+seed: 42
+
 dialog_tree:
-  max_depth: 2
-  question_expansion_factor: 2
-  answer_expansion_factor: 2
+  max_depth: 3
+  question_expansion_factor: 3
+  answer_expansion_factor: 1
   question_diverse_sample_count: 5  # Questions are generally naturally diverse so 5 samples should produce at least 2 clusters
   answer_diverse_sample_count: 5  # Answers are generally not very diverse, but when there is only one answer there is only one answer.
+  inference_diverse_sample_count: 5
   # There being multiple answers often indicates that the model is trying to give away the answer.
 
 devices:
-  clarification: 'cuda:3'
-  answer: 'cuda:4'
-  semantic_cluster: 'cuda:4'
+  clarification: [4,5]
+  answer: [6,7]
+  semantic_cluster: [0]
+
+remote_vllm:
+  clarification:
+    port: 29002
+    log_file: "clarification_vllm_remote.log"
+  answer:
+    port: 29003
+    log_file: "answer_vllm_remote.log"
 
 defaults:
   # - clarification_model: qwen_3_vl_32b_lora_small

@@ -21,17 +21,17 @@ class TransformersModel:
     bnb_config: Optional[BitsAndBytesConfig]
     max_new_tokens: int
 
-    def __init__(self, model_config: DictConfig, device: str):
+    def __init__(self, model_config: DictConfig, device: str | int, allow_quantization: bool = True):
         self.model_config = model_config
         self.model_name = model_config.model_name
-        self.device = device
+        self.device = device if isinstance(device, str) and not device.isnumeric() else f"cuda:{device}"
         self.max_new_tokens = model_config.max_new_tokens
 
         self.image_resize_config = model_config.get("image_resize_config", None)
         if self.image_resize_config:
             print(f"Image resizing enabled: {self.image_resize_config}")
 
-        if "bnb_config" in model_config:
+        if "bnb_config" in model_config and allow_quantization:
             print("Loading model with BNB config")
             self.bnb_config = BitsAndBytesConfig(**model_config.bnb_config)
         else:
@@ -360,3 +360,35 @@ class TransformersModel:
         generated_ids_trimmed = generated_ids[:, inputs.input_ids.shape[1]:]
         generated_text = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)
         return generated_text
+
+    def merge_and_save_adapter(self, save_dir: Path) -> None:
+        """
+        Merges the currently loaded LoRA adapter into the base model and saves the resulting 
+        standalone model and processor to the specified directory.
+        
+        This output directory can be passed directly to `vllm serve`.
+        """
+        if self.adapted_model is None:
+            raise ValueError("Cannot merge: No adapter is currently loaded.")
+
+        if self.bnb_config is not None:
+            print("WARNING: Attempting to merge a LoRA into a Quantized (BitsAndBytes) base model.")
+            print("This requires dequantizing weights to FP16/FP32 in memory and may cause OOM.")
+
+        print("Merging LoRA weights into base model...")
+        # merge_and_unload() removes the LoRA layers, merges weights into base, and returns the base model.
+        # Note: This modifies the model in memory.
+        merged_model = self.adapted_model.merge_and_unload()
+
+        output_path = save_dir.absolute().as_posix()
+        print(f"Saving merged model to {output_path}...")
+        
+        # Save the model weights (SafeTensors)
+        merged_model.save_pretrained(output_path, safe_serialization=True)
+        
+        # IMPORTANT: Save the processor. vLLM needs 'preprocessor_config.json' and 
+        # 'chat_template.json' (if present) to handle images and prompts correctly.
+        print("Saving processor...")
+        self.processor.save_pretrained(output_path)
+        
+        print(f"Merge complete. You can now run: vllm serve {output_path}")

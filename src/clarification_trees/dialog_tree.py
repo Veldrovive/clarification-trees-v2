@@ -1,7 +1,12 @@
 from enum import Enum
 from PIL import Image
-from typing import Optional, List
+from typing import Optional, List, Any
 from pathlib import Path
+import json
+import hashlib
+import tempfile
+import os
+from graphviz import Digraph
 
 class NodeType(Enum):
     ROOT = 0  # The initial question and paired image
@@ -21,10 +26,15 @@ class DialogNode:
         "assistant": "user"
     }
 
-    def __init__(self, node_type: NodeType, image: Optional[Image.Image], response: str):
+    def __init__(self, node_type: NodeType, image: Optional[Image.Image], image_path: Optional[Path], response: str):
         self.node_type = node_type
         self.image = image
         self.response = response
+        self.image_path = image_path
+        if self.image_path is None:
+            recovered_path = getattr(self.image, "filename", None)
+            if recovered_path is not None:
+                self.image_path = Path(recovered_path)
 
         self.model_name_to_message_generator = {
             "qwen-3-vl": self._to_qwen_message,
@@ -34,10 +44,23 @@ class DialogNode:
             "qwen-3-vl-32b": self._to_qwen_message,
         }
 
-    def _to_qwen_message(self, reverse_roles: bool = False):
+    def _to_qwen_message(self, reverse_roles: bool = False, use_img_path: bool = False):
         content = []
-        if self.image is not None:
-            content.append({"type": "image", "image": self.image})
+        if self.image is not None or self.image_path is not None:
+            img_content: dict[str, Any] = {"type": "image"}
+            if use_img_path:
+                # Then we use the image path instead of the image itself as the data
+                assert self.image_path is not None, "If using image paths, the image path must be set"
+                img_content["image_url"] = {"url": f"file://{self.image_path}"}
+                img_content["uuid"] = self.image_path.name
+            else:
+                assert self.image is not None, "If not using image paths, the image must be set"
+                img_content["image"] = self.image
+                if self.image_path is not None:
+                    img_content["uuid"] = self.image_path.name
+                else:
+                    img_content["uuid"] = hashlib.md5(self.image.tobytes()).hexdigest()
+            content.append(img_content)
         if self.response is not None and len(self.response) > 0:
             content.append({"type": "text", "text": self.response})
         assert len(content) > 0, "DialogNode must have either an image or a response"
@@ -51,20 +74,44 @@ class DialogNode:
             "content": content
         }
 
-    def to_message(self, model_name: str, reverse_roles: bool = False):
-        return self.model_name_to_message_generator[model_name](reverse_roles)
+    def to_message(self, model_name: str, reverse_roles: bool = False, use_img_path: bool = False):
+        return self.model_name_to_message_generator[model_name](reverse_roles, use_img_path)
 
     def to_string(self):
         string = f"{self.node_type_to_str[self.node_type]}: {self.response}"
         if self.image is not None:
-            try:
-                string += f" (w/ Image: {Path(self.image.filename).name})"
-            except AttributeError:
+            if self.image_path is not None:
+                string += f" (w/ Image: {self.image_path.name})"
+            else:
                 string += f" (w/ Image: {self.image})"
         return string
 
     def __repr__(self):
         return self.to_string()
+
+    def to_dict(self):
+        return {
+            "node_type": self.node_type.value,
+            "image_path": self.image_path.absolute().as_posix() if self.image_path is not None else None,
+            "response": self.response
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        node_type = NodeType(data["node_type"])
+        response = data["response"]
+        image_path = data.get("image_path")
+        if image_path is not None:
+            image_path = Path(image_path)
+        image = None
+        if image_path is not None:
+            try:
+                image = Image.open(image_path)
+            except (FileNotFoundError, OSError):
+                print(f"Warning: Could not reload image at {image_path}")
+                image = None
+                
+        return cls(node_type, image, image_path, response)
 
 class DialogTrajectory:
     trajectory: List[DialogNode]
@@ -81,8 +128,8 @@ class DialogTrajectory:
             leaf_node_idx = parent_idx
         return trajectory
 
-    def to_messages(self, model_name: str, reverse_roles: bool = False):
-        return [node.to_message(model_name, reverse_roles) for node in self.trajectory][::-1]
+    def to_messages(self, model_name: str, reverse_roles: bool = False, use_img_path: bool = False):
+        return [node.to_message(model_name, reverse_roles, use_img_path) for node in self.trajectory][::-1]
 
     def to_string(self):
         string = f"Trajectory of length: {len(self.trajectory)}\n"
@@ -98,26 +145,170 @@ class DialogTree:
 
     def __init__(
         self,
-        init_question: str, init_image: Image.Image, init_image_caption: str | None = None,
+        init_question: str, init_image: Image.Image | None = None, init_image_path: Path | None = None,
+        init_image_caption: str | None = None,
         unambiguous_question: str | None = None,
         gold_answer: str | None = None, answers: List[str] | None = None
     ):
         # self.init_data = (-1, NodeType.ROOT, init_image, init_question)  # Parent index, Node type, Image, Question
-        self.init_data = (-1, DialogNode(NodeType.ROOT, init_image, init_question))
+        self.init_data = (-1, DialogNode(NodeType.ROOT, init_image, init_image_path, init_question))
         self.nodes = [self.init_data]
+        self.transition_probs: dict[tuple[int, int], float | None] = {}  # Maps (parent_idx, child_idx) to transition probability
 
+        self.init_question = init_question
+        self.init_image = init_image
+        self.init_image_path = init_image_path
         self.init_image_caption = init_image_caption
         self.unambiguous_question = unambiguous_question
         self.gold_answer = gold_answer
         self.answers = answers
 
-    def add_node(self, parent_idx: int, node_type: NodeType, image: Optional[Image.Image], response: str):
-        self.nodes.append((parent_idx, DialogNode(node_type, image, response)))
+    def add_node(self, parent_idx: int, node_type: NodeType, response: str, image: Optional[Image.Image] = None, image_path: Path | None = None, transition_prob: float | None = None):
+        self.nodes.append((parent_idx, DialogNode(node_type, image, image_path, response)))
         added_index = len(self.nodes) - 1
+        self.transition_probs[(parent_idx, added_index)] = transition_prob
         return added_index
 
     def get_trajectory(self, node_idx: int):
         return DialogTrajectory.from_dialog_tree(self, node_idx)
+
+    def save(self, output_path: str | Path):
+        """Saves the dialog tree to a JSON file."""
+        data = {
+            "init_image_caption": self.init_image_caption,
+            "unambiguous_question": self.unambiguous_question,
+            "gold_answer": self.gold_answer,
+            "answers": self.answers,
+            # Serialize nodes: list of [parent_index, node_dict]
+            "nodes": [
+                (parent_idx, node.to_dict()) 
+                for parent_idx, node in self.nodes
+            ],
+            # Serialize transitions: list of [parent_idx, child_idx, probability]
+            "transition_probs": [
+                (p, c, prob) 
+                for (p, c), prob in self.transition_probs.items()
+            ]
+        }
+
+        with open(output_path, 'w') as f:
+            json.dump(data, f, indent=4)
+
+    @classmethod
+    def load(cls, input_path: str | Path):
+        """Loads a dialog tree from a JSON file."""
+        with open(input_path, 'r') as f:
+            data = json.load(f)
+
+        # Reconstruct the root node to initialize the tree
+        root_parent_idx, root_node_data = data["nodes"][0]
+        root_node = DialogNode.from_dict(root_node_data)
+        assert root_node.image is not None, "Root node must have an image to be loaded"
+        
+        # Initialize tree with root data
+        tree = cls(
+            init_question=root_node.response,
+            init_image=root_node.image,
+            init_image_caption=data.get("init_image_caption"),
+            unambiguous_question=data.get("unambiguous_question"),
+            gold_answer=data.get("gold_answer"),
+            answers=data.get("answers")
+        )
+        
+        # Override the automatically created root node to ensure exact match (though usually identical)
+        tree.nodes = [(root_parent_idx, root_node)]
+
+        # Add remaining nodes
+        for parent_idx, node_data in data["nodes"][1:]:
+            node = DialogNode.from_dict(node_data)
+            tree.nodes.append((parent_idx, node))
+
+        # Restore transition probabilities
+        tree.transition_probs = {
+            (p, c): prob 
+            for p, c, prob in data["transition_probs"]
+        }
+
+        return tree
+
+def visualize_tree(dialog_tree: 'DialogTree', output_filename: str = "dialog_tree", view: bool = True):
+    """
+    Generates a visual flow diagram of the DialogTree using Graphviz.
+    
+    Args:
+        dialog_tree: The DialogTree instance.
+        output_filename: The name of the file to save (without extension).
+        view: Whether to open the rendered file immediately.
+    """
+    
+    # Create the directed graph
+    dot = Digraph(name='DialogTree', comment='Dialog Tree Visualization')
+    dot.attr(rankdir='TB')  # Top to Bottom layout
+    dot.attr('node', shape='plaintext') # Use plaintext so our HTML tables define the shape
+    
+    # distinct colors for roles
+    colors = {
+        NodeType.ROOT: "#E0F7FA",                  # Cyan-ish (User)
+        NodeType.CLARIFICATION_QUESTION: "#FFF3E0",# Orange-ish (Assistant)
+        NodeType.CLARIFYING_ANSWER: "#E0F7FA",     # Cyan-ish (User)
+        NodeType.INFERENCE: "#E8F5E9"              # Green-ish (Final Answer)
+    }
+
+    # Helper to handle image paths for graphviz
+    temp_dir = tempfile.mkdtemp()
+    
+    for idx, (parent_idx, node) in enumerate(dialog_tree.nodes):
+        
+        # 1. Prepare Image HTML
+        img_html = ""
+        if node.image is not None:
+            # We need a physical path for Graphviz to load the image.
+            # If image_path exists, use it; otherwise save a temp file from PIL.
+            if node.image_path and node.image_path.exists():
+                img_fpath = node.image_path.absolute().as_posix()
+            else:
+                # Save temp image from PIL
+                img_fpath = os.path.join(temp_dir, f"node_{idx}.png")
+                node.image.save(img_fpath)
+            
+            # Scale image to fit nicely in the box
+            img_html = f'<tr><td><img src="{img_fpath}" scale="true" width="150"/></td></tr>'
+
+        # 2. Prepare Text Content
+        # Truncate long responses for readability
+        display_text = node.response
+        if len(display_text) > 100:
+            display_text = display_text[:97] + "..."
+        
+        # Escape HTML special characters in text
+        display_text = display_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        # 3. Construct Node Label (HTML-like)
+        bg_color = colors.get(node.node_type, "#FFFFFF")
+        
+        label = f'''<<table border="0" cellborder="1" cellspacing="0" cellpadding="4" bgcolor="{bg_color}">
+            <tr><td bgcolor="#333333"><font color="white"><b>{node.node_type.name}</b></font></td></tr>
+            {img_html}
+            <tr><td>{display_text}</td></tr>
+        </table>>'''
+
+        dot.node(str(idx), label=label)
+
+        # 4. Create Edges
+        if parent_idx != -1:
+            # Check for transition probability
+            prob = dialog_tree.transition_probs.get((parent_idx, idx))
+            edge_label = f"{prob:.2f}" if prob is not None else ""
+            dot.edge(str(parent_idx), str(idx), label=edge_label)
+
+    # Render
+    try:
+        output_path = dot.render(output_filename, format='png', view=view)
+        print(f"Visualization saved to: {output_path}")
+        return output_path
+    except Exception as e:
+        print(f"Error rendering Graphviz: {e}")
+        print("Ensure 'graphviz' is installed on your system (e.g., 'brew install graphviz' or 'apt-get install graphviz')")
 
 
 if __name__ == "__main__":
@@ -133,27 +324,29 @@ if __name__ == "__main__":
     test_img_path = Path(__file__).parent.parent.parent / "data/clearvqa/images/train_000000.jpg"
     test_img = Image.open(test_img_path)
 
-    tree = DialogTree("What is this?", test_img, "A cat", ["A cat", "A dog", "A person"])
+    tree = DialogTree("What is this?", test_img, test_img_path, "A cat", "What is this animal?", "A cat", ["A cat", "A dog", "A person"])
 
     # Insert the left branch that leads to the correct answer directly
-    left_branch_1 = tree.add_node(0, NodeType.CLARIFICATION_QUESTION, None, "Are you referring to the animal on the left?")
-    left_branch_2 = tree.add_node(left_branch_1, NodeType.CLARIFYING_ANSWER, None, "Yes")
-    left_branch_answer = tree.add_node(left_branch_2, NodeType.INFERENCE, None, "A cat")
+    left_branch_1 = tree.add_node(0, NodeType.CLARIFICATION_QUESTION, "Are you referring to the animal on the left?")
+    left_branch_2 = tree.add_node(left_branch_1, NodeType.CLARIFYING_ANSWER, "Yes")
+    left_branch_answer = tree.add_node(left_branch_2, NodeType.INFERENCE, "A cat")
 
     # Insert the right branch that further splits at the CLARIFYING_ANSWER node
-    right_branch_1 = tree.add_node(0, NodeType.CLARIFICATION_QUESTION, None, "Are you referring to the animal on the right?")
-    right_branch_right_2 = tree.add_node(right_branch_1, NodeType.CLARIFYING_ANSWER, None, "Yes")
-    right_branch_right_3 = tree.add_node(right_branch_right_2, NodeType.CLARIFICATION_QUESTION, None, "Are you referring to a white animal?")
-    right_branch_right_4 = tree.add_node(right_branch_right_3, NodeType.CLARIFYING_ANSWER, None, "Yes")
-    right_branch_right_answer = tree.add_node(right_branch_right_4, NodeType.INFERENCE, None, "A dog")
+    right_branch_1 = tree.add_node(0, NodeType.CLARIFICATION_QUESTION, "Are you referring to the animal on the right?")
+    right_branch_right_2 = tree.add_node(right_branch_1, NodeType.CLARIFYING_ANSWER, "Yes")
+    right_branch_right_3 = tree.add_node(right_branch_right_2, NodeType.CLARIFICATION_QUESTION, "Are you referring to a white animal?")
+    right_branch_right_4 = tree.add_node(right_branch_right_3, NodeType.CLARIFYING_ANSWER, "Yes")
+    right_branch_right_answer = tree.add_node(right_branch_right_4, NodeType.INFERENCE, "A dog")
     
-    right_branch_left_2 = tree.add_node(right_branch_1, NodeType.CLARIFYING_ANSWER, None, "No")
-    right_branch_left_answer = tree.add_node(right_branch_left_2, NodeType.INFERENCE, None, "A cat")
+    right_branch_left_2 = tree.add_node(right_branch_1, NodeType.CLARIFYING_ANSWER, "No")
+    right_branch_left_answer = tree.add_node(right_branch_left_2, NodeType.INFERENCE, "A cat")
 
     # print(tree.nodes)
     
     for final_answer_node in [left_branch_answer, right_branch_right_answer, right_branch_left_answer]:
         trajectory = tree.get_trajectory(final_answer_node)
         print("\n")
-        for message in trajectory.to_messages("qwen-3-vl-2b"):
+        for message in trajectory.to_messages("qwen-3-vl-2b", use_img_path=False):
             print(f"\t{message}")
+
+    visualize_tree(tree, output_filename="tree_viz", view=False)

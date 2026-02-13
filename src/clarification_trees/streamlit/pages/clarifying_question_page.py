@@ -6,7 +6,7 @@ Allows user to create answers to the clarifying questions and then has the model
 
 import streamlit as st
 from PIL import Image
-
+from pathlib import Path
 from clarification_trees.streamlit.utils import load_clarification_model, load_answer_model, load_semantic_clusterer, load_clearvqa_dataset
 from clarification_trees.streamlit.components import dialog_trajectory_component
 from clarification_trees.dialog_tree import DialogTree, NodeType
@@ -26,7 +26,7 @@ def show_custom_input_modal():
             image = Image.open(uploaded_file).convert("RGB")
             
             # Create new tree
-            tree = DialogTree(custom_question, image)
+            tree = DialogTree(custom_question, image, Path(uploaded_file.name))
             
             # Update session state
             st.session_state["cqp_dialog_tree"] = tree
@@ -81,12 +81,13 @@ def clarifying_question_page():
         
         # We construct a new dialog tree for the selected sample
         sample = dataset[selected_index]
-        image = sample[0]
-        ambiguous_question = sample[1]["blurred_question"]
-        img_caption = sample[1]["caption"]
-        unambiguous_question = sample[1]["question"]
-        gold_answer = sample[1]["gold_answer"]
-        answers = sample[1]["answers"]
+        image = sample.image
+        assert image is not None, "ClearVQADataset was created without image loading enabled."
+        ambiguous_question = sample.blurred_question
+        img_caption = sample.caption
+        unambiguous_question = sample.question
+        gold_answer = sample.gold_answer
+        answers = sample.answers
         # clarifying_question = sample[1]["clarification_question"]
 
         tree = DialogTree(ambiguous_question, image, init_image_caption=img_caption, unambiguous_question=unambiguous_question, gold_answer=gold_answer, answers=answers)
@@ -118,53 +119,17 @@ def clarifying_question_page():
             # Then we are generating an answer
             # st.error("Cannot generate an answerer to a clarifying question yet")
             print(f"Last node type: {dialog_trajectory.trajectory[0].node_type}. Generating answer to question {dialog_trajectory.trajectory[0].response}")
-            base_system_prompt = cfg.answer_model.base_prompt
-            full_system_prompt = f"""
-You are pretending to be a human in a dialog with an AI assistant.
-Your goal: Answer the assistant's clarifying question to help them realize you are asking about: "{dialog_tree.unambiguous_question}".
-
-Constraints:
-1. Answer the clarifying question honestly.
-2. Include only minimal information to help the assistant. You are training the assistant to ask good questions.
-3. CRITICAL: Do NOT simply state the answer to the unambiguous question (e.g., do not say the number, name, or specific value).
-4. Only describe the location, color, or type of object you are interested in.
-5. Answer vague questions with vague answers. Provide only the information that was asked for.
-
-Examples:
-Image - A bowl of fruit on a table with a red apple on the left, a green apple on the right, a banana, and an orange.
-Unambiguous Question - "What color is the apple on the right"
-Ambiguous Question - "What color is it?"
-Allowed Answers - ["green"]
-
-Clarifying Question - "Are you talking about an apple"
-Good Answer - "Yes"
-Bad Answer - "Yes, the apple on the right"
-Additional information is witheld.
-
-Clarifying Question - "Are you talking about the apple on the left"
-Good Answer - "No" or "No, I am talking about the apple on the right"
-Question is asking about location, so location can be included in the answer.
-
-Current Context:
-Allowed Answers: {dialog_tree.answers}
-
-Given next is the full conversation:
-            """.strip()
-            # Ambiguous Question: "{dialog_trajectory.trajectory[-1].response}"
-            # Assistant's Clarification: "{dialog_trajectory.trajectory[0].response}"
-            # Image caption: {dialog_tree.init_image_caption}
-            # Gold Answer: {dialog_tree.gold_answer}
-            # All Answers: {dialog_tree.answers}
+            base_system_prompt = cfg.answer_model.answer_base_prompt.strip().format(unambiguous_question=dialog_tree.unambiguous_question, answers=dialog_tree.answers)
             with st.spinner("Generating answer"):
-                prediction = answer_model.generate(dialog_trajectory, base_prompt_override=full_system_prompt, as_user=True)
+                prediction = answer_model.generate(dialog_trajectory, base_prompt_override=base_system_prompt, as_user=True)
                 print(f"Generated answer: {prediction}")
                 if produce_diverse_outputs:
-                    diverse_predictions = answer_model.generate_diverse(dialog_trajectory, num_samples=num_diverse_outputs, base_prompt_override=full_system_prompt, as_user=True)
+                    diverse_predictions = answer_model.generate_diverse(dialog_trajectory, num_samples=num_diverse_outputs, base_prompt_override=base_system_prompt, as_user=True)
                     clustered_diverse_predictions, diverse_semantic_centers = semantic_clusterer.cluster(diverse_predictions)
                     st.session_state["cqp_diverse_predictions"] = clustered_diverse_predictions
                     st.session_state["cqp_diverse_semantic_centers"] = diverse_semantic_centers
 
-            ca = dialog_tree.add_node(dialog_tree_leaf, NodeType.CLARIFYING_ANSWER, None, prediction[0])
+            ca = dialog_tree.add_node(dialog_tree_leaf, NodeType.CLARIFYING_ANSWER, prediction[0])
             st.session_state["cqp_dialog_tree_leaf"] = ca
             st.rerun()
         else:
@@ -176,18 +141,18 @@ Given next is the full conversation:
                     clustered_diverse_predictions, diverse_semantic_centers = semantic_clusterer.cluster(diverse_predictions)
                     st.session_state["cqp_diverse_predictions"] = clustered_diverse_predictions
                     st.session_state["cqp_diverse_semantic_centers"] = diverse_semantic_centers
-            cq = dialog_tree.add_node(dialog_tree_leaf, NodeType.CLARIFICATION_QUESTION, None, prediction[0])
+            cq = dialog_tree.add_node(dialog_tree_leaf, NodeType.CLARIFICATION_QUESTION, prediction[0])
             st.session_state["cqp_dialog_tree_leaf"] = cq
             st.rerun()
 
     if user_response is not None:
         print(f"User response: {user_response}")
         if dialog_trajectory.trajectory[0].node_type == NodeType.CLARIFICATION_QUESTION:
-            ca = dialog_tree.add_node(dialog_tree_leaf, NodeType.CLARIFYING_ANSWER, None, user_response)
+            ca = dialog_tree.add_node(dialog_tree_leaf, NodeType.CLARIFYING_ANSWER, user_response)
             st.session_state["cqp_dialog_tree_leaf"] = ca
             st.rerun()
         else:
-            cq = dialog_tree.add_node(dialog_tree_leaf, NodeType.CLARIFICATION_QUESTION, None, user_response)
+            cq = dialog_tree.add_node(dialog_tree_leaf, NodeType.CLARIFICATION_QUESTION, user_response)
             st.session_state["cqp_dialog_tree_leaf"] = cq
             st.rerun()
 

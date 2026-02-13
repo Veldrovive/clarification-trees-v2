@@ -1,3 +1,4 @@
+from omegaconf import ListConfig
 from abc import ABC, abstractmethod
 from typing import List, Tuple
 from omegaconf import DictConfig
@@ -134,7 +135,7 @@ class SemanticClusterer(Clusterer):
         return grouped_clusters, semantic_centers
 
 
-class BidirectionalEntailmentClusterer(Clusterer):
+class SlowBidirectionalEntailmentClusterer(Clusterer):
     def __init__(self, config: DictConfig, device: str):
         super().__init__(config, device)
         self.model_name = config.cross_encoder_key
@@ -152,6 +153,7 @@ class BidirectionalEntailmentClusterer(Clusterer):
         """
         Checks if A -> B AND B -> A.
         """
+        # TODO: Add support for doing N^2 entailment checks in parallel
         inputs = [[text_a, text_b], [text_b, text_a]]
         scores = self.model.predict(inputs) # Returns logits [batch, 3]
         # Convert to probabilities
@@ -208,6 +210,94 @@ class BidirectionalEntailmentClusterer(Clusterer):
         # We fallback to simple heuristics.
         exemplars = self._select_exemplars(clusters)
         
+        return clusters, exemplars
+
+class BidirectionalEntailmentClusterer(Clusterer):
+    def __init__(self, config: DictConfig, device: str):
+        super().__init__(config, device)
+        self.model_name = config.cross_encoder_key
+        self.similarity_threshold = config.entailment_threshold
+        
+        print(f"Loading Cross-Encoder: {self.model_name}...")
+        if isinstance(self.device, list) or isinstance(self.device, ListConfig):
+            assert len(self.device) == 1, "Cross-encoder only supports single GPU"
+            self.device_str = f"cuda:{self.device[0]}"
+        elif str(self.device).isnumeric():
+            self.device_str = f"cuda:{self.device}"
+        else:
+            raise ValueError(f"Invalid device: {self.device} ({type(self.device)})")
+        print(f"Using device: {self.device_str}")
+        self.model = CrossEncoder(self.model_name, device=self.device_str)
+        self.entailment_label_index = 1
+
+    def cluster(self, texts: List[str]) -> Tuple[List[List[str]], List[str]]:
+        if not texts:
+            return [], []
+            
+        n = len(texts)
+        if n == 1:
+            return [texts], texts
+
+        # 1. Prepare N^2 inputs (All permutations)
+        # We need (A, B) and (B, A) for all pairs to compute the full matrix.
+        # For N=20, this is 400 inference pairs.
+        inputs = []
+        for i in range(n):
+            for j in range(n):
+                inputs.append([texts[i], texts[j]])
+
+        # 2. Batched Inference
+        # Returns logits [batch_size, num_labels]
+        scores_logits = self.model.predict(
+            inputs, 
+            batch_size=512,
+            show_progress_bar=False
+        )
+
+        # 3. Convert to Entailment Probabilities
+        # Softmax over the label dimension (usually 3: Contradiction, Entailment, Neutral)
+        probs = torch.softmax(torch.tensor(scores_logits), dim=1).numpy()
+        entailment_scores = probs[:, self.entailment_label_index]
+
+        # 4. Reshape into N x N matrix
+        # matrix[i][j] = Score(Text_i -> Text_j)
+        score_matrix = entailment_scores.reshape((n, n))
+
+        # 5. Calculate Bidirectional Similarity
+        # Sim(A, B) = min( Score(A->B), Score(B->A) )
+        # We symmetrize the matrix by taking the element-wise minimum of M and M.T
+        similarity_matrix = np.minimum(score_matrix, score_matrix.T)
+
+        # Ensure diagonal is perfect (Self-entailment is always 1.0)
+        np.fill_diagonal(similarity_matrix, 1.0)
+
+        # 6. Clustering
+        # We use Agglomerative Clustering with 'precomputed' affinity.
+        # linkage='complete' ensures ALL members of a cluster are close to each other 
+        # (similar to your strict entailment check), not just close to a "center".
+        # We convert similarity to distance: distance = 1 - similarity
+        distance_matrix = 1 - similarity_matrix
+        
+        # We use a distance threshold derived from your similarity threshold
+        dist_threshold = 1 - self.similarity_threshold
+        
+        clustering = AgglomerativeClustering(
+            n_clusters=None,
+            metric='precomputed',
+            linkage='complete', 
+            distance_threshold=dist_threshold
+        )
+        
+        labels = clustering.fit_predict(distance_matrix)
+
+        # 7. Group Results
+        clusters = [[] for _ in range(max(labels) + 1)]
+        for text_idx, cluster_id in enumerate(labels):
+            clusters[cluster_id].append(texts[text_idx])
+
+        # 8. Select Exemplars (e.g., shortest text, or central-most)
+        exemplars = self._select_exemplars(clusters)
+
         return clusters, exemplars
 
 class HybridClusterer(Clusterer):
@@ -449,7 +539,7 @@ if __name__ == "__main__":
         "How do I get to the bank?",             # Navigation instructions vs Location coordinates
     ]
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     print(f"Running on device: {device}\n")
 
     # 1. Run Semantic Clustering (Embedding Based)

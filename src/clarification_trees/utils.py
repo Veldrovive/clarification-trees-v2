@@ -1,3 +1,4 @@
+from omegaconf import DictConfig
 import os
 import sys
 import random
@@ -111,3 +112,51 @@ def set_seed(seed=42):
         torch.mps.manual_seed(seed)
         
     print(f"Random seed set to {seed} (CUDA: {torch.cuda.is_available()}, MPS: {torch.backends.mps.is_available()})")
+
+def add_cq_messages(messages: list[dict], cfg: DictConfig | None = None, model_cfg: DictConfig | None = None) -> list[dict]:
+    assert cfg is None or model_cfg is None, "Only one of cfg or model_cfg can be provided"
+
+    if cfg is not None:
+        system_prompt = cfg.clarification_model.base_prompt
+    elif model_cfg is not None:
+        system_prompt = model_cfg.base_prompt
+    else:
+        raise ValueError("Either cfg or model_cfg must be provided")
+
+    messages.insert(0, {"role": "system", "content": [{"type": "text", "text": system_prompt}]})
+    return messages
+
+def add_answer_messages(messages: list[dict], unambiguous_question: str, answers: list[str], cfg: DictConfig | None = None, model_cfg: DictConfig | None = None) -> list[dict]:
+    assert cfg is None or model_cfg is None, "Only one of cfg or model_cfg can be provided"
+
+    if cfg is not None:
+        system_prompt = cfg.answer_model.answer_base_prompt
+        instruction_prompt = cfg.answer_model.answer_instruction_prompt
+    elif model_cfg is not None:
+        system_prompt = model_cfg.answer_base_prompt
+        instruction_prompt = model_cfg.answer_instruction_prompt
+    else:
+        raise ValueError("Either cfg or model_cfg must be provided")
+
+    formatted_system_prompt = system_prompt.format(unambiguous_question=unambiguous_question, answers=answers)
+
+    messages.insert(0, {"role": "system", "content": [{"type": "text", "text": formatted_system_prompt}]})
+    messages.append({"role": "user", "content": [{"type": "text", "text": instruction_prompt}]})
+    return messages
+
+def add_inference_messages(messages: list[dict], cfg: DictConfig | None = None, model_cfg: DictConfig | None = None) -> list[dict]:
+    assert cfg is None or model_cfg is None, "Only one of cfg or model_cfg can be provided"
+
+    if cfg is not None:
+        system_prompt = cfg.answer_model.inference_base_prompt
+        instruction_prompt = cfg.answer_model.inference_instruction_prompt
+    elif model_cfg is not None:
+        system_prompt = model_cfg.inference_base_prompt
+        instruction_prompt = model_cfg.inference_instruction_prompt
+    else:
+        raise ValueError("Either cfg or model_cfg must be provided")
+
+    messages.insert(0, {"role": "system", "content": [{"type": "text", "text": system_prompt}]})
+    messages.append({"role": "user", "content": [{"type": "text", "text": instruction_prompt}]})
+    return messages
+        

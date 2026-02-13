@@ -4,6 +4,8 @@ outputs/
 wandb/
 *.out
 *.log
+venv_vllm/
+output_results/
 
 # Computer specific rc file to set caches
 .projrc
