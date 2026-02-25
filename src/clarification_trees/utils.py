@@ -8,6 +8,63 @@ import numpy as np
 import torch
 import re
 from typing import Any
+import spacy
+from dataclasses import dataclass
+
+class SentenceAnalyzer:
+    @dataclass
+    class SentenceMetadata:
+        text: str
+        length: int
+        is_question: bool
+
+    def __init__(self, model_name: str = "en_core_web_sm"):
+        # Download model if not already installed
+        # This can be problematic if the python environment is odd. If python -m pip will fail, this will not work
+        try:
+            self.nlp = spacy.load(model_name)
+        except OSError:
+            compatibility = spacy.cli.download_module.get_compatibility()
+            version = spacy.cli.download_module.get_version(model_name, compatibility)
+            filename = spacy.cli.download_module.get_model_filename(model_name, version, False)
+            url = spacy.about.__download_url__ + "/" + filename
+            print(f"Please download spacy model {model_name} by running: `pip install {url}`")
+            sys.exit(1)
+        
+
+    def analyze_sentences(self, text: str) -> list["SentenceAnalyzer.SentenceMetadata"]:
+        """
+        Parses a string into sentences and returns metadata for each.
+    
+        Args:
+            text (str): The input text to analyze.
+            
+        Returns:
+            list[SentenceAnalyzer.SentenceMetadata]: A list of SentenceMetadata objects, where each object contains:
+                - 'text': The string content of the sentence.
+                - 'length': The character count of the sentence.
+                - 'is_question': Boolean indicating if it ends with a question mark.
+        """
+        if not text:
+            return []
+
+        doc = self.nlp(text)
+        
+        results = []
+        for sent in doc.sents:
+            # Strip whitespace for accurate length and cleaner text
+            sent_text = sent.text.strip()
+            
+            if not sent_text:
+                continue
+            
+            results.append(SentenceAnalyzer.SentenceMetadata(
+                text=sent_text,
+                length=len(sent_text),
+                is_question=sent_text.endswith("?")
+            ))
+        
+        return results
 
 def get_git_commit(short=True):
     """

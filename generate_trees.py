@@ -6,10 +6,10 @@ We can use asyncio with vLLM to keep the logic for each tree separate and add qu
 independently. This greatly simplifies the logic for managing the frontiers of all trees and batching input.
 """
 
+from clarification_trees.models import BidirectionalEntailmentClusterer
 from clarification_trees.utils import add_inference_messages
 from clarification_trees.dataset import ClearVQASample
 import asyncio
-from src.clarification_trees.models.vllm.remote_vllm_model import RemoteVLLMModel
 import dotenv
 dotenv.load_dotenv()
 
@@ -22,12 +22,17 @@ from pathlib import Path
 from tqdm import tqdm
 import asyncio
 from contextlib import asynccontextmanager
+import json
+import time
+from codetiming import Timer
+from rich.tree import Tree
+from rich import print
 
-from clarification_trees.dialog_tree import DialogTree, NodeType, DialogTrajectory
-from clarification_trees.models.vllm import QwenModelInputProcessor, CQModelWorker, GenericModelWorker, RemoteCQModel
+from clarification_trees.dialog_tree import DialogTree, NodeType, DialogTrajectory, TreeSidecar
+from clarification_trees.models.vllm import RemoteVLLMModel
 from clarification_trees.models import Clusterer, construct_semantic_clusterer
 from clarification_trees.dataset import ClearVQADataset
-from clarification_trees.utils import set_seed, add_cq_messages, add_answer_messages
+from clarification_trees.utils import set_seed, add_cq_messages, add_answer_messages, get_judge_messages, processes_judge_response, SentenceAnalyzer
 
 @asynccontextmanager
 async def use_models(cfg: DictConfig):
@@ -70,6 +75,8 @@ async def use_models(cfg: DictConfig):
     clusterer_cfg = cfg['semantic_cluster_model']
     clusterer_gpus = cfg.devices.semantic_cluster
     clusterer = construct_semantic_clusterer(clusterer_cfg, clusterer_gpus)
+    # We decided to always use the bidirectional entailment clusterer
+    assert isinstance(clusterer, BidirectionalEntailmentClusterer), "Only bidirectional entailment clusterer is supported"
 
     try:
         yield clarification_model, answer_model, clusterer
@@ -151,10 +158,12 @@ class DialogTreeDFSManager:
 async def expand_tree(
     cfg: DictConfig,
     tree: DialogTree,
-    clusterer: Clusterer,
+    clusterer: BidirectionalEntailmentClusterer,
     cq_model: RemoteVLLMModel,
     answer_model: RemoteVLLMModel,
-):
+    sentence_analyzer: SentenceAnalyzer,
+    out_dir: Path
+) -> tuple[Path, Path]:
     dialog_tree_config = cfg.dialog_tree
     max_depth = dialog_tree_config.max_depth
     question_expansion_factor = dialog_tree_config.question_expansion_factor
@@ -169,91 +178,112 @@ async def expand_tree(
     answer_node_types = set([NodeType.CLARIFICATION_QUESTION])  # Node types that cause the tree to be expanded using the answer model
 
     async def _generate_inference(tree: DialogTree, answer_node_ids: list[int], n_outputs: int):
-        for answer_node_id in answer_node_ids:
-            dialog_trajectory = tree.get_trajectory(answer_node_id)
+        with Timer("tree/generate_inference", logger=None):
+            for answer_node_id in answer_node_ids:
+                dialog_trajectory = tree.get_trajectory(answer_node_id)
+                messages = dialog_trajectory.to_messages(model_name="qwen-3-vl", use_img_path=True)
+                add_inference_messages(messages, cfg=cfg)
+
+                with Timer("tree/generate_inference/generate", logger=None):
+                    request_output = await answer_model.generate(messages, n_outputs=n_outputs, use_lora=False)
+                generated_texts = [o.message.content for o in request_output.choices if o.message.content is not None]
+
+                with Timer("tree/generate_inference/cluster", logger=None):
+                    clusters, exemplars = await clusterer.async_cluster(generated_texts)
+
+                probabilities = [len(cluster) / len(generated_texts) for cluster in clusters]
+
+                for exemplar, probability in zip(exemplars, probabilities):
+                    tree.add_node(
+                        parent_idx=answer_node_id,
+                        node_type=NodeType.INFERENCE,
+                        response=exemplar,
+                        transition_prob=probability
+                    )
+
+
+    with Timer("tree", logger=None):
+        # We always start by making an inference from the root node.
+        await _generate_inference(tree, [DialogTree.ROOT], inference_diverse_sample_count)
+        while dialog_tree_manager.has_open_nodes():
+            dialog_trajectory, input_node_type, node_id = dialog_tree_manager.get_next_node()
             messages = dialog_trajectory.to_messages(model_name="qwen-3-vl", use_img_path=True)
-            add_inference_messages(messages, cfg=cfg)
 
-            request_output = await answer_model.generate(messages, n_outputs=n_outputs, use_lora=False)
-            generated_texts = [o.message.content for o in request_output.choices if o.message.content is not None]
+            if input_node_type in cq_node_types:
+                add_cq_messages(messages, cfg=cfg)
 
-            clusters, exemplars = clusterer.cluster(generated_texts)
+                engine = cq_model
+                sample_count = question_diverse_sample_count
+                expansion_factor = question_expansion_factor
+                output_node_type = NodeType.CLARIFICATION_QUESTION
+                use_lora = True
+                timer_key = "generate_cq"
+            elif input_node_type in answer_node_types:
+                assert tree.unambiguous_question is not None
+                assert tree.answers is not None
+                add_answer_messages(messages, unambiguous_question=tree.unambiguous_question, answers=tree.answers, cfg=cfg)
 
-            probabilities = [len(cluster) / len(generated_texts) for cluster in clusters]
+                engine = answer_model
+                sample_count = answer_diverse_sample_count
+                expansion_factor = answer_expansion_factor
+                output_node_type = NodeType.CLARIFYING_ANSWER
+                use_lora = False
+                timer_key = "generate_ca"
+            else:
+                raise ValueError(f"Unknown node type: {input_node_type}")
 
-            for exemplar, probability in zip(exemplars, probabilities):
-                tree.add_node(
-                    parent_idx=answer_node_id,
-                    node_type=NodeType.INFERENCE,
-                    response=exemplar,
-                    transition_prob=probability
-                )
+            with Timer(f"tree/{timer_key}", logger=None):
+                with Timer(f"tree/{timer_key}/generate", logger=None):
+                    # request_output = await engine.generate.remote(vllm_inputs, n_outputs=sample_count, request_id=node_uuid)
+                    request_output = await engine.generate(messages, n_outputs=sample_count, use_lora=use_lora)
+                    generated_texts = [o.message.content for o in request_output.choices if o.message.content is not None]
 
+                with Timer(f"tree/{timer_key}/cluster", logger=None):
+                    clusters, exemplars = await clusterer.async_cluster(generated_texts)
 
-    # We always start by making an inference from the root node.
-    await _generate_inference(tree, [DialogTree.ROOT], inference_diverse_sample_count)
-    while dialog_tree_manager.has_open_nodes():
-        dialog_trajectory, input_node_type, node_id = dialog_tree_manager.get_next_node()
-        messages = dialog_trajectory.to_messages(model_name="qwen-3-vl", use_img_path=True)
+            # We may have more clusters than the expansion factor allows
+            # If this is the case, we randomly select a subset of the clusters to use
+            # We may also have fewer in which case we use all of them
+            if len(clusters) > expansion_factor:
+                cluster_indices = random.sample(range(len(clusters)), expansion_factor)
+                clusters = [clusters[i] for i in cluster_indices]
+                exemplars = [exemplars[i] for i in cluster_indices]
+            total_allowed_texts = sum([len(cluster) for cluster in clusters])
+            probabilities = [len(cluster) / total_allowed_texts for cluster in clusters]
+            assert np.isclose(sum(probabilities), 1.0)
 
-        if input_node_type in cq_node_types:
-            add_cq_messages(messages, cfg=cfg)
+            new_node_ids = dialog_tree_manager.add_children(
+                parent_node_id=node_id,
+                new_node_texts=exemplars,
+                new_node_trans_probs=probabilities,
+                output_node_type=output_node_type
+            )
 
-            engine = cq_model
-            sample_count = question_diverse_sample_count
-            expansion_factor = question_expansion_factor
-            output_node_type = NodeType.CLARIFICATION_QUESTION
-            use_lora = True
-        elif input_node_type in answer_node_types:
-            assert tree.unambiguous_question is not None
-            assert tree.answers is not None
-            add_answer_messages(messages, unambiguous_question=tree.unambiguous_question, answers=tree.answers, cfg=cfg)
+            if output_node_type == NodeType.CLARIFYING_ANSWER:
+                await _generate_inference(tree, new_node_ids, answer_diverse_sample_count)
+    
 
-            engine = answer_model
-            sample_count = answer_diverse_sample_count
-            expansion_factor = answer_expansion_factor
-            output_node_type = NodeType.CLARIFYING_ANSWER
-            use_lora = False
-        else:
-            raise ValueError(f"Unknown node type: {input_node_type}")
+    tree_save_path = out_dir / f"tree.json"
+    sidecar_save_path = out_dir / f"tree_sidecar.json"
+    tree.save(tree_save_path)
 
-        # request_output = await engine.generate.remote(vllm_inputs, n_outputs=sample_count, request_id=node_uuid)
-        request_output = await engine.generate(messages, n_outputs=sample_count, use_lora=use_lora)
-        generated_texts = [o.message.content for o in request_output.choices if o.message.content is not None]
+    with Timer("reward", logger=None):
+        sidecar = TreeSidecar(tree_save_path, cfg)
+        await sidecar.compute_all_scores(answer_model, sentence_analyzer, clusterer)
+        sidecar.save(sidecar_save_path)
 
-        clusters, exemplars = clusterer.cluster(generated_texts)
+    return tree_save_path, sidecar_save_path
 
-        # We may have more clusters than the expansion factor allows
-        # If this is the case, we randomly select a subset of the clusters to use
-        # We may also have fewer in which case we use all of them
-        if len(clusters) > expansion_factor:
-            cluster_indices = random.sample(range(len(clusters)), expansion_factor)
-            clusters = [clusters[i] for i in cluster_indices]
-            exemplars = [exemplars[i] for i in cluster_indices]
-        total_allowed_texts = sum([len(cluster) for cluster in clusters])
-        probabilities = [len(cluster) / total_allowed_texts for cluster in clusters]
-        assert np.isclose(sum(probabilities), 1.0)
-
-        new_node_ids = dialog_tree_manager.add_children(
-            parent_node_id=node_id,
-            new_node_texts=exemplars,
-            new_node_trans_probs=probabilities,
-            output_node_type=output_node_type
-        )
-
-        if output_node_type == NodeType.CLARIFYING_ANSWER:
-            await _generate_inference(tree, new_node_ids, answer_diverse_sample_count)
-
-    return tree
 
 async def process_dataset_lazily(
     cfg: DictConfig,
     dataset: ClearVQADataset,
-    clusterer: Clusterer,
+    clusterer: BidirectionalEntailmentClusterer,
     cq_model: RemoteVLLMModel,
     answer_model: RemoteVLLMModel,
+    sentence_analyzer: SentenceAnalyzer,
+    out_dir: Path,
     N_parallel_trees: int = 10,
-    out_dir: Path | None = None
 ):
     # Configuration
     total_items = len(dataset)
@@ -264,6 +294,7 @@ async def process_dataset_lazily(
     # Initialize progress bar
     pbar = tqdm(total=total_items, desc="Expanding Trees")
 
+    n_done = 0
     for i in range(total_items):
         # 1. THROTTLING: If we are full, wait for at least one task to finish
         if len(active_tasks) >= N_parallel_trees:
@@ -276,28 +307,23 @@ async def process_dataset_lazily(
             # 2. CLEANUP: Process finished tasks and remove from active set
             for task in done:
                 try:
-                    finished_tree: DialogTree = await task # Retrieve the result (or raise exception)
-                    if out_dir:
-                        img_path = finished_tree.init_image_path
-                        if img_path is None:
-                            out_file = out_dir / f"tree_{uuid.uuid4()}.json"
-                        else:
-                            img_name = img_path.stem
-                            out_file = out_dir / f"tree_{img_name}_{uuid.uuid4()}.json"
-                        finished_tree.save(out_file)
-                    else:
-                        print("Warning: No output directory provided. Tree will not be saved.")
+                    finished_tree_paths, finished_sidecar_path = await task # Retrieve the result (or raise exception)
                 except Exception as e:
                     print(f"Task failed: {e}")
                 finally:
                     pbar.update(1)
+                    n_done += 1
+
+                    if (n_done + 1) % N_parallel_trees == 0:
+                        print(f"\n\nTimer breakdown after {n_done} trees:")
+                        print_timer_tree()
             
             # Update active_tasks to only contain the ones still running
             active_tasks = pending
 
         # 3. LAZY LOADING: Now that we have a slot, load the data
         # The image is loaded into memory HERE, not before.
-        sample = dataset[i] 
+        sample = dataset[i]
         tree = DialogTree(
             init_question=sample.blurred_question,
             init_image=None,
@@ -310,6 +336,13 @@ async def process_dataset_lazily(
 
         # 4. DISPATCH: Create the coroutine and track it
         # We wrap it in a task immediately
+        img_path = tree.init_image_path
+        if img_path is None:
+            out_dir_i = out_dir / f"tree_{uuid.uuid4()}.json"
+        else:
+            img_name = img_path.stem
+            out_dir_i = out_dir / f"tree_{img_name}_{uuid.uuid4()}.json"
+        out_dir_i.mkdir(parents=True, exist_ok=True)
         task = asyncio.create_task(
             expand_tree(
                 cfg=cfg,
@@ -317,6 +350,8 @@ async def process_dataset_lazily(
                 clusterer=clusterer,
                 cq_model=cq_model,
                 answer_model=answer_model,
+                sentence_analyzer=sentence_analyzer,
+                out_dir=out_dir_i
             )
         )
         active_tasks.add(task)
@@ -326,23 +361,14 @@ async def process_dataset_lazily(
         done, _ = await asyncio.wait(active_tasks)
         for task in done:
             try:
-                finished_tree: DialogTree = await task
-                if out_dir:
-                    img_path = finished_tree.init_image_path
-                    if img_path is None:
-                        out_file = out_dir / f"tree_{uuid.uuid4()}.json"
-                    else:
-                        img_name = img_path.stem
-                        out_file = out_dir / f"tree_{img_name}_{uuid.uuid4()}.json"
-                    finished_tree.save(out_file)
+                finished_tree_paths: tuple[Path, Path] = await task
             except Exception as e:
                 print(f"Task failed: {e}")
             pbar.update(1)
-            
     pbar.close()
 
 
-async def run_single_tree_test(cfg: DictConfig, sample: ClearVQASample):
+async def run_single_tree_test(cfg: DictConfig, sample: ClearVQASample, base_dir: Path):
     test_tree = DialogTree(
         init_question=sample.blurred_question,
         init_image=None,
@@ -353,27 +379,78 @@ async def run_single_tree_test(cfg: DictConfig, sample: ClearVQASample):
         answers=sample.answers
     )
 
+    sentence_analyzer = SentenceAnalyzer()
+
     async with use_models(cfg) as (cq_model, answer_model, clusterer):
-        await expand_tree(
-            cfg=cfg,
-            tree=test_tree,
-            clusterer=clusterer,
-            cq_model=cq_model,
-            answer_model=answer_model,
-        )
+        out_dir = base_dir / "single_tree_test"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with Timer("total"):
+            await expand_tree(
+                cfg=cfg,
+                tree=test_tree,
+                clusterer=clusterer,
+                cq_model=cq_model,
+                answer_model=answer_model,
+                sentence_analyzer=sentence_analyzer,
+                out_dir=out_dir
+            )
+
+    print_timer_tree()
 
 async def run_expand_trees(cfg: DictConfig, ds: ClearVQADataset, out_dir: Path, n_parallel_trees: int = 10):
-    async with use_models(cfg) as (cq_model, answer_model, clusterer):
-        await process_dataset_lazily(
-            cfg=cfg,
-            dataset=ds,
-            clusterer=clusterer,
-            cq_model=cq_model,
-            answer_model=answer_model,
-            N_parallel_trees=n_parallel_trees,
-            out_dir=out_dir
-        )
+    sentence_analyzer = SentenceAnalyzer()
 
+    async with use_models(cfg) as (cq_model, answer_model, clusterer):
+        with Timer("total"):
+            await process_dataset_lazily(
+                cfg=cfg,
+                dataset=ds,
+                clusterer=clusterer,
+                cq_model=cq_model,
+                answer_model=answer_model,
+                sentence_analyzer=sentence_analyzer,
+                N_parallel_trees=n_parallel_trees,
+                out_dir=out_dir
+            )
+
+    print_timer_tree()
+
+def print_timer_tree():
+    data = Timer.timers
+
+    if "total" in data:
+        total_time = data.pop("total")
+        root = Tree(f"[bold cyan]Total[/]: [yellow]{total_time:.2f}[/]")
+    else:
+        total_time = None
+        root = Tree("Root", hide_root=True)
+    
+    # We keep a map of path -> tree_node to avoid rebuilding branches
+    # We strip the dummy root logic for simplicity by sorting keys
+    path_map = {}
+
+    for key, value in sorted(data.items()):
+        parts = key.split('/')
+        
+        # Determine the leaf name and formatting
+        name = parts[-1]
+        if total_time is not None:
+            label = f"[bold cyan]{name}[/]: [yellow]{value:.2f}[/] [dim]({value/total_time*100:.1f}%)[/dim]"
+        else:
+            label = f"[bold cyan]{name}[/]: [yellow]{value:.2f}[/]"
+        
+        parent_path = "/".join(parts[:-1])
+        
+        if parent_path in path_map:
+            # Add to existing parent
+            node = path_map[parent_path].add(label)
+        else:
+            # This is a top-level node (like 'tree' or 'reward')
+            node = root.add(label)
+            
+        path_map[key] = node
+
+    print(root)
 
 @hydra.main(config_path="src/clarification_trees/config", config_name="config", version_base=None)
 def main(cfg: DictConfig):
@@ -384,16 +461,16 @@ def main(cfg: DictConfig):
     out_path = Path("./data/trees")
     out_path.mkdir(parents=True, exist_ok=True)
 
-    ds = ClearVQADataset(load_images=False)
+    ds = ClearVQADataset(load_images=False, table_name="val_annotated.jsonl")
 
     if SINGLE_TREE_TEST:
         sample = ds[0]
-        asyncio.run(run_single_tree_test(cfg, sample))
+        asyncio.run(run_single_tree_test(cfg, sample, out_path))
     else:
-        N_parallel_trees = 10
+        N_parallel_trees = 25
 
         # from torch.utils.data import Subset
-        # ds = Subset(ds, range(500))
+        # ds = Subset(ds, range(25))
 
         asyncio.run(run_expand_trees(cfg, ds, out_path, n_parallel_trees=N_parallel_trees))
 

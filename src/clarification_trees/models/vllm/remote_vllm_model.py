@@ -28,7 +28,7 @@ class RemoteVLLMModel:
         max_model_len: int = 4096 * 2,
         gpu_memory_utilization: float = 0.9,
         port: int = 29002,
-        startup_timeout: int = 180,
+        startup_timeout: int = 60*5,
         max_lora_rank: int = 64,
         log_file: Path | None = None,
         environment_path: Path | None = None,
@@ -113,7 +113,7 @@ class RemoteVLLMModel:
         }
 
         async with httpx.AsyncClient() as client:
-            response = await client.post(remove_lora_url, json=payload)
+            response = await client.post(remove_lora_url, json=payload, timeout=60)
             if response.status_code != 200:
                 raise Exception(f"Failed to unload LoRA adapter {lora_id}: {response.text}")
 
@@ -136,7 +136,7 @@ class RemoteVLLMModel:
         }
         
         async with httpx.AsyncClient() as client:
-            response = await client.post(add_lora_url, json=payload)
+            response = await client.post(add_lora_url, json=payload, timeout=60)
             if response.status_code != 200:
                 raise Exception(f"Failed to load LoRA adapter {lora_id}: {response.text}")
             
@@ -221,11 +221,24 @@ class RemoteVLLMModel:
         else:
             print(f"Stop called, but vLLM server on port {self.port} is external or not running")
 
-    async def generate(self, messages, n_outputs: int = 1, model_key: str | None = None, use_lora: bool | None = None) -> ChatCompletion:
+    async def generate(self, messages, n_outputs: int = 1, use_tokens_as_ids: bool = False, logprobs: int | bool | None = None, model_key: str | None = None, use_lora: bool | None = None) -> ChatCompletion:
         sampling_params = {
             **self.sampling_params,
+            "return_token_ids": True,
             "n": n_outputs
         }
+
+        if use_tokens_as_ids:
+            sampling_params["return_tokens_as_token_ids"] = True
+
+        if logprobs is not None:
+            if isinstance(logprobs, bool):
+                sampling_params["logprobs"] = logprobs
+            elif isinstance(logprobs, int):
+                sampling_params["logprobs"] = True
+                sampling_params["top_logprobs"] = logprobs
+            else:
+                raise ValueError(f"logprobs must be a boolean or an integer, got {logprobs}")
 
         assert model_key is None or use_lora is None, "Cannot specify both model_key and use_lora"
         if model_key is not None:
@@ -247,7 +260,7 @@ class RemoteVLLMModel:
         response = await self.client.chat.completions.create(
             model=chosen_key,
             messages=messages,
-            extra_body=sampling_params
+            extra_body=sampling_params,
         )
 
         return response

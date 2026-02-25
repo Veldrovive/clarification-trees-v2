@@ -7,6 +7,15 @@ import hashlib
 import tempfile
 import os
 from graphviz import Digraph
+import numpy as np
+from omegaconf import DictConfig
+from codetiming import Timer
+import textwrap
+
+from clarification_trees.utils import get_judge_messages, processes_judge_response, SentenceAnalyzer
+from clarification_trees.models.semantic_clustering import BidirectionalEntailmentClusterer
+from clarification_trees.models.vllm import RemoteVLLMModel
+
 
 class NodeType(Enum):
     ROOT = 0  # The initial question and paired image
@@ -153,6 +162,7 @@ class DialogTree:
         # self.init_data = (-1, NodeType.ROOT, init_image, init_question)  # Parent index, Node type, Image, Question
         self.init_data = (-1, DialogNode(NodeType.ROOT, init_image, init_image_path, init_question))
         self.nodes = [self.init_data]
+        self.children: dict[int, List[int]] = {0: []}
         self.transition_probs: dict[tuple[int, int], float | None] = {}  # Maps (parent_idx, child_idx) to transition probability
 
         self.init_question = init_question
@@ -163,10 +173,27 @@ class DialogTree:
         self.gold_answer = gold_answer
         self.answers = answers
 
+    def get_parent_idx(self, node_idx: int) -> int:
+        return self.nodes[node_idx][0]
+
+    def get_children_idxs(self, parent_idx: int, type_filter: NodeType | None = None) -> List[int]:
+        if type_filter is None:
+            return self.children[parent_idx]
+        else:
+            return [child_idx for child_idx in self.children[parent_idx] if self.nodes[child_idx][1].node_type == type_filter]
+
+    def get_node(self, node_idx: int) -> DialogNode:
+        return self.nodes[node_idx][1]
+
+    def get_nodes(self, node_type: NodeType | None = None) -> List[tuple[int, DialogNode]]:
+        return [(idx, node) for idx, (parent_idx, node) in enumerate(self.nodes) if node_type is None or node.node_type == node_type]
+
     def add_node(self, parent_idx: int, node_type: NodeType, response: str, image: Optional[Image.Image] = None, image_path: Path | None = None, transition_prob: float | None = None):
         self.nodes.append((parent_idx, DialogNode(node_type, image, image_path, response)))
         added_index = len(self.nodes) - 1
         self.transition_probs[(parent_idx, added_index)] = transition_prob
+        self.children[parent_idx].append(added_index)
+        self.children[added_index] = []
         return added_index
 
     def get_trajectory(self, node_idx: int):
@@ -184,6 +211,8 @@ class DialogTree:
                 (parent_idx, node.to_dict()) 
                 for parent_idx, node in self.nodes
             ],
+            # Serialize children: list of [parent_idx, child_idx]
+            "children": self.children,
             # Serialize transitions: list of [parent_idx, child_idx, probability]
             "transition_probs": [
                 (p, c, prob) 
@@ -222,6 +251,7 @@ class DialogTree:
         for parent_idx, node_data in data["nodes"][1:]:
             node = DialogNode.from_dict(node_data)
             tree.nodes.append((parent_idx, node))
+        tree.children = {int(k): v for k, v in data["children"].items()}
 
         # Restore transition probabilities
         tree.transition_probs = {
@@ -231,7 +261,296 @@ class DialogTree:
 
         return tree
 
-def visualize_tree(dialog_tree: 'DialogTree', output_filename: str = "dialog_tree", view: bool = True):
+class TreeSidecar:
+    """
+    Stores metadata used for computing the reward at each node
+    """
+    def __init__(self, tree_path: Path, cfg: DictConfig, inference_score_range: tuple[int, int] = (0, 10)):
+        self.tree_path = tree_path
+        assert tree_path.exists()
+        self.cfg = cfg
+        self.inference_score_range = inference_score_range
+
+        self.inference_scores: dict[int, float] = {}
+        self.inference_scores_raw: dict[int, list[int]] = {}
+
+        self.question_presence_costs: dict[int, float] = {}
+        self.entailment_costs: dict[int, float] = {}
+
+        self.reward_cache: dict[int, float] = {}
+        self.infer_reward_cache: dict[int, float] = {}
+        self.defer_reward_cache: dict[int, float] = {}
+
+        self.advantage_cache: dict[int, float] = {}
+
+    async def _compute_inference_scores(self, tree: DialogTree, answer_model: RemoteVLLMModel):
+        """
+        Crawl the tree looking for inference nodes and compute the reward for each.
+        """
+        inference_score_cache: dict[str, tuple[float, list[int]]] = {}
+        for node_id, (parent_node_id, node) in enumerate(tree.nodes):
+            if node.node_type != NodeType.INFERENCE:
+                continue
+        
+            inference = node.response
+            # Strip any leading/trailing whitespace and punctuation
+            inference = inference.strip().strip(".")
+
+            if inference in inference_score_cache:
+                self.inference_scores[node_id] = inference_score_cache[inference][0]
+                self.inference_scores_raw[node_id] = inference_score_cache[inference][1]
+            else:
+                assert tree.unambiguous_question is not None
+                assert tree.gold_answer is not None
+                assert tree.answers is not None
+                assert tree.init_image_caption is not None
+                messages = get_judge_messages(
+                    tree.init_question,
+                    tree.gold_answer,
+                    tree.answers,
+                    tree.init_image_caption,
+                    inference_response=inference,
+                    cfg=self.cfg
+                )
+                n_judgements = self.cfg.answer_model.judge_prompts.n_judgements
+                scores_response_obj = await answer_model.generate(messages, use_lora=False, n_outputs=n_judgements)
+
+                scores = []
+                for choice in scores_response_obj.choices:
+                    scores_response = choice.message.content
+                    assert scores_response is not None
+                    reasoning, score = processes_judge_response(scores_response)
+                    scores.append(score)
+                average_reward = sum(scores) / n_judgements
+                # We normalize scores to be between 0 and 1 so that we can weight between rewards more easily
+                normed_score = (average_reward - self.inference_score_range[0]) / (self.inference_score_range[1] - self.inference_score_range[0])
+                self.inference_scores[node_id] = np.clip(normed_score, 0, 1)
+                self.inference_scores_raw[node_id] = scores
+
+                inference_score_cache[inference] = (normed_score, scores)
+
+    async def _compute_question_presence_costs(self, tree: DialogTree, sentence_analyzer: SentenceAnalyzer):
+        """
+        Checks all clarifying questions in the tree to make sure they contain a question and not too many sentences.
+        A question + with at most 2 sentences gets a score of 1.
+        More sentences = 0.5
+        No question = 0
+
+        We use this to incentivize asking quick clear questions. An extra sentence can be an additional question or a sentence providing context.
+        More sentences indicates attempting to ask many questions in one go, which we want to disincentivize.
+        """
+        for node_id, (parent_node_id, node) in enumerate(tree.nodes):
+            if node.node_type != NodeType.CLARIFICATION_QUESTION:
+                continue
+
+            response = node.response
+            sentences = sentence_analyzer.analyze_sentences(response)
+
+            n_questions = 0
+            n_long_sentences = 0
+            n_sentences = len(sentences)
+            for sentence in sentences:
+                if sentence.is_question:
+                    n_questions += 1
+                if len(sentence.text.split()) > 25:
+                    n_long_sentences += 1
+
+            if n_questions == 0:
+                cost = -1.0
+            elif n_sentences <= 2:
+                cost = 0.0
+            else:
+                cost = -0.5
+
+            cost -= n_long_sentences * 0.15
+            self.question_presence_costs[node_id] = cost
+
+    async def _compute_entailment_costs(self, tree: DialogTree, clusterer: BidirectionalEntailmentClusterer):
+        """
+        Used to supress redundant questions. For each clarifying question we check if it is entailed by any previous question in the branch.
+        """
+        # So that we can batch well, our first step is to collect a list of entailment pairs
+        entailment_pair_node_indices: list[tuple[int, int]] = []
+        enailment_pairs: list[tuple[str, str]] = []  # List of [previous question, checked question]
+        for node_id, (parent_node_id, node) in enumerate(tree.nodes):
+            if node.node_type != NodeType.CLARIFICATION_QUESTION:
+                continue
+            
+            # We need to step backward through the tree and whenever we come across a clarifying question we add it to the list
+            previous_node_id = node_id
+            while previous_node_id != DialogTree.ROOT:
+                previous_node_id = tree.nodes[previous_node_id][0]
+                previous_node = tree.nodes[previous_node_id][1]
+                if previous_node.node_type == NodeType.CLARIFICATION_QUESTION:
+                    entailment_pair_node_indices.append((previous_node_id, node_id))
+                    enailment_pairs.append((previous_node.response, node.response))
+
+        # Now that we have the batch we can compute the entailment scores
+        entailment_scores_raw = await clusterer.async_compute_entailments(enailment_pairs)
+        assert len(entailment_scores_raw) == len(entailment_pair_node_indices)
+        # entailment_scores is the probability that the second sentence is entailed by the first
+        # To get our redundant question score we take the max probability that a previous question entails the current one
+        previous_entailed_node_id = None
+        current_node_scores = []
+        entailment_costs = {}
+        for i in range(len(entailment_scores_raw)):
+            entailment_score = entailment_scores_raw[i]
+            previous_node_id, node_id = entailment_pair_node_indices[i]
+
+            if node_id != previous_entailed_node_id:
+                if len(current_node_scores) > 0:
+                    max_entailment_score = max(current_node_scores)
+                    entailment_costs[previous_entailed_node_id] = np.clip(-max_entailment_score.item(), -1, 0)
+                current_node_scores = []
+                previous_entailed_node_id = node_id
+            current_node_scores.append(entailment_score)
+        
+        max_entailment_score = max(current_node_scores)
+        # The entailment score is the probability that the second sentence is entailed by the first
+        # So we take 1 - max_entailment_score to get the probability that the second sentence is not entailed by the first so that higher is better
+        entailment_costs[previous_entailed_node_id] = np.clip(-max_entailment_score.item(), -1, 0)
+
+        self.entailment_costs = entailment_costs
+
+    async def compute_all_scores(self, answer_model: RemoteVLLMModel, sentence_analyzer: SentenceAnalyzer, clusterer: BidirectionalEntailmentClusterer):
+        tree = DialogTree.load(self.tree_path)
+        with Timer("reward/inference_score", logger=None):
+            await self._compute_inference_scores(tree, answer_model)
+        with Timer("reward/question_presence_score", logger=None):
+            await self._compute_question_presence_costs(tree, sentence_analyzer)
+        with Timer("reward/entailment_score", logger=None):
+            await self._compute_entailment_costs(tree, clusterer)
+
+    def _compute_reward_recursive(self, tree: DialogTree, rewards: dict[int, float], cur_node_id: int) -> float:
+        # Step 0: Check for base case: We are an inference node. If we are not and have no children, this is an error.
+        node = tree.get_node(cur_node_id)
+        if node.node_type == NodeType.INFERENCE:
+            rewards[cur_node_id] = self.inference_scores[cur_node_id]
+            return rewards[cur_node_id]
+
+        # Step 1: Compute rewards for all children
+        child_node_idxs = tree.get_children_idxs(cur_node_id)
+        if len(child_node_idxs) == 0:
+            raise ValueError(f"Node {cur_node_id} has no children.")
+        
+        child_rewards = []
+        for child_node_idx in child_node_idxs:
+            child_rewards.append(self._compute_reward_recursive(tree, rewards, child_node_idx))
+        
+        # Step 2: Compute expected inference score for all children that are INFERENCE nodes
+        total_inference_prob: float = 0
+        inference_reward: float = 0
+        for i,child_idx in enumerate(child_node_idxs):
+            if tree.get_node(child_idx).node_type != NodeType.INFERENCE:
+                continue
+
+            transition_prob = tree.transition_probs[(cur_node_id, child_idx)]
+            assert transition_prob is not None, f"Probability of transition from {cur_node_id} to {child_idx} is None."
+            child_reward = child_rewards[i]
+            inference_reward += transition_prob * child_reward
+            total_inference_prob += transition_prob
+        assert np.isclose(total_inference_prob, 1) or total_inference_prob == 0, f"Total inference probability is {total_inference_prob}. It must be either 0 or 1."
+        if total_inference_prob == 0:
+            inference_reward = -np.inf
+        
+        # Step 3: Compute expected reward for all children that are not INFERENCE nodes
+        total_deferral_prob: float = 0
+        deferral_reward: float = 0
+        for i, child_idx in enumerate(child_node_idxs):
+            if tree.get_node(child_idx).node_type == NodeType.INFERENCE:
+                continue
+
+            transition_prob = tree.transition_probs[(cur_node_id, child_idx)]
+            assert transition_prob is not None, f"Probability of transition from {cur_node_id} to {child_idx} is None."
+            child_reward = child_rewards[i]
+            deferral_reward += transition_prob * child_reward
+            total_deferral_prob += transition_prob
+        assert np.isclose(total_deferral_prob, 1) or total_deferral_prob == 0, f"Total deferral probability is {total_deferral_prob}. It must be either 0 or 1."
+        if total_deferral_prob == 0:
+            deferral_reward = -np.inf
+
+        # Apply costs (Costs are given as negative values, so we add them)
+        if cur_node_id in self.question_presence_costs:
+            deferral_reward += self.question_presence_costs[cur_node_id]
+        if cur_node_id in self.entailment_costs:
+            deferral_reward += self.entailment_costs[cur_node_id]
+        
+        # Step 5: Compute reward for current node
+        reward = max(inference_reward, deferral_reward)
+        self.infer_reward_cache[cur_node_id] = inference_reward
+        self.defer_reward_cache[cur_node_id] = deferral_reward
+        rewards[cur_node_id] = reward
+        return reward
+
+    def _compute_advantage(self, tree: DialogTree, rewards: dict[int, float]):
+        """
+        Computes the advantage for each set of siblings where each sibling is a node of type CLARIFYING_QUESTION.
+        The computation is to find the STD of all rewards in the tree, subtract the mean of the siblings, and divide by the STD.
+        """
+        advantages = {}
+
+        # Step 1: Compute the std of all rewards in the tree
+        std = np.std(list(rewards.values()))
+        assert std > 0, f"Standard deviation of rewards is {std}. It must be greater than 0."
+
+        # Step 2: Iterate over all nodes in the tree to find those that have children that are clarifying questions
+        seen_parent_ids = set()
+        for node_idx, node in tree.get_nodes(NodeType.CLARIFICATION_QUESTION):
+            parent_id = tree.get_parent_idx(node_idx)
+            if parent_id in seen_parent_ids:
+                continue
+            seen_parent_ids.add(parent_id)
+
+            # We haven't seen this parent and we know that it has at least one child that is a clarifying question.
+            # Next step is to find the mean of all children of type CLARIFYING_QUESTION.
+            children = tree.get_children_idxs(parent_id, type_filter=NodeType.CLARIFICATION_QUESTION)
+            mean = np.mean([rewards[child] for child in children])
+
+            for child_idx in children:
+                advantage = (rewards[child_idx] - mean) / std
+                advantages[child_idx] = advantage
+
+        return advantages
+
+    def compute_rewards(self):
+        """
+        We compute rewards using a backtracking DFS.
+        We use an optimal stopping criterion to decide where reward comes from.
+        First, we get the expected reward for inferring now by taking the expected inference score of children of type INFERENCE.
+        Then, we compute the expected reward for deferring by taking the expected reward of all non-INFERENCE children.
+        The reward for this node is the max of these two values.
+        """
+        tree = DialogTree.load(self.tree_path)
+        rewards = {}
+        self._compute_reward_recursive(tree, rewards, DialogTree.ROOT)
+        self.reward_cache = rewards
+        self.advantage_cache = self._compute_advantage(tree, rewards)
+
+    def save(self, output_path: Path):
+        data = {
+            "tree_path": str(self.tree_path),
+            "inference_scores": self.inference_scores,
+            "inference_scores_raw": self.inference_scores_raw,
+            "question_presence_costs": self.question_presence_costs,
+            "entailment_costs": self.entailment_costs
+        }
+        with open(output_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    @classmethod
+    def load(cls, input_path: Path, cfg: DictConfig):
+        assert input_path.exists()
+        with open(input_path, "r") as f:
+            data = json.load(f)
+        tree_path = Path(data["tree_path"])
+        tree_sidecar = cls(tree_path, cfg)
+        tree_sidecar.inference_scores = {int(k): v for k, v in data["inference_scores"].items()}
+        tree_sidecar.inference_scores_raw = {int(k): v for k, v in data["inference_scores_raw"].items()}
+        tree_sidecar.question_presence_costs = {int(k): v for k, v in data["question_presence_costs"].items()}
+        tree_sidecar.entailment_costs = {int(k): v for k, v in data["entailment_costs"].items()}
+        return tree_sidecar
+
+def visualize_tree(dialog_tree: DialogTree, tree_sidecar: TreeSidecar | None = None, output_filename: str = "dialog_tree", view: bool = True):
     """
     Generates a visual flow diagram of the DialogTree using Graphviz.
     
@@ -243,7 +562,7 @@ def visualize_tree(dialog_tree: 'DialogTree', output_filename: str = "dialog_tre
     
     # Create the directed graph
     dot = Digraph(name='DialogTree', comment='Dialog Tree Visualization')
-    dot.attr(rankdir='TB')  # Top to Bottom layout
+    dot.attr(rankdir='LR')  # Top to Bottom layout
     dot.attr('node', shape='plaintext') # Use plaintext so our HTML tables define the shape
     
     # distinct colors for roles
@@ -256,6 +575,10 @@ def visualize_tree(dialog_tree: 'DialogTree', output_filename: str = "dialog_tre
 
     # Helper to handle image paths for graphviz
     temp_dir = tempfile.mkdtemp()
+
+    # Cache the rewards
+    if tree_sidecar is not None:
+        tree_sidecar.compute_rewards()
     
     for idx, (parent_idx, node) in enumerate(dialog_tree.nodes):
         
@@ -274,22 +597,97 @@ def visualize_tree(dialog_tree: 'DialogTree', output_filename: str = "dialog_tre
             # Scale image to fit nicely in the box
             img_html = f'<tr><td><img src="{img_fpath}" scale="true" width="150"/></td></tr>'
 
-        # 2. Prepare Text Content
-        # Truncate long responses for readability
-        display_text = node.response
-        if len(display_text) > 100:
-            display_text = display_text[:97] + "..."
+        # # 2. Prepare Text Content
+        # # Truncate long responses for readability
+        # display_text = node.response
+        # if len(display_text) > 100:
+        #     display_text = display_text[:97] + "..."
+        display_text = textwrap.fill(node.response, width=50)
         
         # Escape HTML special characters in text
         display_text = display_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        display_text = display_text.replace("\n", "<br/>")
+
+        # Get node sidecar metadata
+        meta_text = None
+        reward_text = None
+        if tree_sidecar is not None:
+            if node.node_type == NodeType.INFERENCE:
+                inference_score = tree_sidecar.inference_scores.get(idx, None)
+                if inference_score is not None:
+                    meta_text = f"Inference Score: {inference_score:.2f}"
+                else:
+                    meta_text = "Inference Score: Not Found"
+            elif node.node_type == NodeType.CLARIFICATION_QUESTION:
+                question_presence_score = tree_sidecar.question_presence_costs.get(idx, None)
+                entailment_score = tree_sidecar.entailment_costs.get(idx, None)
+                if question_presence_score is not None:
+                    meta_text = f"Question Presence Score: {question_presence_score:.2f}"
+                else:
+                    meta_text = "Question Presence Score: Not Found"
+                if entailment_score is not None:
+                    meta_text += f"<BR/>Entailment Score: {entailment_score:.2f}"
+                else:
+                    meta_text += "<BR/>Entailment Score: Not Found"
+            
+            if idx in tree_sidecar.reward_cache:
+                reward = tree_sidecar.reward_cache[idx]
+                infer_reward = tree_sidecar.infer_reward_cache.get(idx, None)
+                if infer_reward is not None and infer_reward != float('-inf'):
+                    infer_reward = f"{infer_reward:.2f}"
+                else:
+                    infer_reward = "N/A"
+                defer_reward = tree_sidecar.defer_reward_cache.get(idx, None)
+                if defer_reward is not None and defer_reward != float('-inf'):
+                    defer_reward = f"{defer_reward:.2f}"
+                else:
+                    defer_reward = "N/A"
+                reward_text = f"Reward: {reward:.2f} (Infer: {infer_reward}, Defer: {defer_reward})"
+
+            if idx in tree_sidecar.advantage_cache:
+                advantage = tree_sidecar.advantage_cache[idx]
+                if reward_text is None:
+                    reward_text = ""
+                else:
+                    reward_text += "<BR/>"
+                reward_text += f"Advantage: {advantage:.2f}"
+                
 
         # 3. Construct Node Label (HTML-like)
+        header_color = "#333333"
         bg_color = colors.get(node.node_type, "#FFFFFF")
+        meta_color = "#eeeeee"
+
+        match node.node_type:
+            case NodeType.INFERENCE:
+                node_type_name = "Inference"
+                additional_rows = ""
+            case NodeType.CLARIFICATION_QUESTION:
+                node_type_name = "Clarification Question"
+                additional_rows = ""
+            case NodeType.CLARIFYING_ANSWER:
+                node_type_name = "Clarifying Answer"
+                additional_rows = ""
+            case NodeType.ROOT:
+                node_type_name = "Root"
+                if dialog_tree.unambiguous_question is not None and dialog_tree.gold_answer is not None:
+                    additional_rows = f"""
+                    <tr><td bgcolor="{meta_color}">Orig Q: {textwrap.fill(dialog_tree.unambiguous_question, width=50).replace("\n", "<br/>")}</td></tr>
+                    <tr><td bgcolor="{meta_color}">Gold A: {dialog_tree.gold_answer}</td></tr>
+                    <tr><td bgcolor="{meta_color}">All As: {dialog_tree.answers}</td></tr>
+                    """
+                else:
+                    additional_rows = ""
+            case _:
+                raise ValueError(f"Unknown node type: {node.node_type}")
         
         label = f'''<<table border="0" cellborder="1" cellspacing="0" cellpadding="4" bgcolor="{bg_color}">
-            <tr><td bgcolor="#333333"><font color="white"><b>{node.node_type.name}</b></font></td></tr>
+            <tr><td bgcolor="{header_color}"><font color="white"><b>{node_type_name}</b></font></td></tr>
             {img_html}
             <tr><td>{display_text}</td></tr>
+            {f"<tr><td bgcolor=\"{meta_color}\">{meta_text}</td></tr>" if meta_text is not None else ""}
+            {f"<tr><td bgcolor=\"{meta_color}\">{reward_text}</td></tr>" if reward_text is not None else ""}
+            {additional_rows}
         </table>>'''
 
         dot.node(str(idx), label=label)

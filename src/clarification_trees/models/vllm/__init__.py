@@ -4,6 +4,7 @@ from qwen_vl_utils import process_vision_info
 from .cq_vllm_model import CQModelWorker
 from .generic_vllm_model import GenericModelWorker
 from .remote_cq_vllm_model import RemoteCQModel
+from .remote_vllm_model import RemoteVLLMModel
 
 class QwenModelInputProcessor:
     def __init__(self, model_cfg: dict):

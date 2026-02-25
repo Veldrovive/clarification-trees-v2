@@ -7,6 +7,9 @@ import torch
 from sentence_transformers import SentenceTransformer, CrossEncoder, util
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from sklearn.cluster import AgglomerativeClustering
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+import functools
 
 class Clusterer(ABC):
     """
@@ -17,6 +20,7 @@ class Clusterer(ABC):
         self.device = device
         # Common config extraction
         self.exemplar_selection_method = config.get("exemplar_selection_method", "random")
+        self.executor = ThreadPoolExecutor(max_workers=5)
 
     @abstractmethod
     def cluster(self, texts: List[str]) -> Tuple[List[List[str]], List[str]]:
@@ -24,6 +28,11 @@ class Clusterer(ABC):
         Clusters texts and returns (list of clusters, list of exemplars).
         """
         pass
+
+    async def async_cluster(self, texts: List[str]) -> Tuple[List[List[str]], List[str]]:
+        loop = asyncio.get_running_loop()
+        func = functools.partial(self.cluster, texts)
+        return await loop.run_in_executor(self.executor, func)
 
     def _select_exemplars(self, clusters: List[List[str]], embeddings: np.ndarray = None) -> List[str]:
         """
@@ -230,6 +239,66 @@ class BidirectionalEntailmentClusterer(Clusterer):
         self.model = CrossEncoder(self.model_name, device=self.device_str)
         self.entailment_label_index = 1
 
+    def compute_entailments(self, statements: list[tuple[str, str]]):
+        """
+        Computes the entailment probabilities of each statement.
+
+        Args:
+            statements: A list of tuples of strings, where each tuple is a pair of statements that we will compare as A->B
+
+        Returns:
+            A list of floats, where each float is the entailment probability of the corresponding statement.
+        """
+        entailment_scores = self.model.predict(
+            statements,
+            batch_size=512,
+            show_progress_bar=False
+        )
+        probs = torch.softmax(torch.tensor(entailment_scores), dim=1).numpy()
+        entailment_scores = probs[:, self.entailment_label_index]
+        return entailment_scores
+
+    async def async_compute_entailments(self, statements: list[tuple[str, str]]):
+        loop = asyncio.get_running_loop()
+        func = functools.partial(self.compute_entailments, statements)
+        return await loop.run_in_executor(self.executor, func)
+
+    def compute_biconditional_entailments(self, statements: list[tuple[str, str]]):
+        """
+        Computes the biconditional entailments of each statement as the minimum of the
+        entailment probabilities of the statement and its reverse.
+
+        Args:
+            statements: A list of tuples of strings, where each tuple is a pair of statements.
+
+        Returns:
+            A list of floats, where each float is the biconditional entailment of the corresponding statement.
+        """
+        inputs = []
+        for i in range(len(statements)):
+            inputs.append([statements[i][0], statements[i][1]])
+            inputs.append([statements[i][1], statements[i][0]])
+
+        scores_logits = self.model.predict(
+            inputs, 
+            batch_size=512,
+            show_progress_bar=False
+        )
+
+        probs = torch.softmax(torch.tensor(scores_logits), dim=1).numpy()
+        entailment_scores = probs[:, self.entailment_label_index]
+
+        biconditional_entailments = []
+        for i in range(len(statements)):
+            biconditional_entailments.append(min(entailment_scores[2*i], entailment_scores[2*i + 1]))
+        
+        return biconditional_entailments
+
+    async def async_compute_biconditional_entailments(self, statements: list[tuple[str, str]]):
+        loop = asyncio.get_running_loop()
+        func = functools.partial(self.compute_biconditional_entailments, statements)
+        return await loop.run_in_executor(self.executor, func)
+
     def cluster(self, texts: List[str]) -> Tuple[List[List[str]], List[str]]:
         if not texts:
             return [], []
@@ -299,6 +368,11 @@ class BidirectionalEntailmentClusterer(Clusterer):
         exemplars = self._select_exemplars(clusters)
 
         return clusters, exemplars
+
+    async def async_cluster(self, texts: List[str]) -> Tuple[List[List[str]], List[str]]:
+        loop = asyncio.get_running_loop()
+        func = functools.partial(self.cluster, texts)
+        return await loop.run_in_executor(self.executor, func)
 
 class HybridClusterer(Clusterer):
     """

@@ -10,7 +10,9 @@ import peft
 import transformers
 from PIL import Image
 
-from clarification_trees.dialog_tree import DialogTrajectory
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from clarification_trees.dialog_tree import DialogTrajectory
 
 class TransformersModel:
     """
@@ -196,7 +198,7 @@ class TransformersModel:
                             item["image"] = self._pad_and_resize_image(item["image"])
         return messages
 
-    def preprocess_generation_inputs(self, trajectory: DialogTrajectory, base_prompt_override: str | None = None, as_user: bool = False):
+    def preprocess_generation_inputs(self, trajectory: "DialogTrajectory", base_prompt_override: str | None = None, as_user: bool = False):
         messages = trajectory.to_messages(model_name=self.model_name, reverse_roles=False)
         messages.insert(0, {"role": "system", "content": [{"type": "text", "text": base_prompt_override or self.model_config.base_prompt}]})
         messages = self._process_images_in_messages(messages)
@@ -244,7 +246,7 @@ class TransformersModel:
         inputs = inputs.to(self.device)
         return inputs
 
-    def preprocess_training_inputs(self, trajectory: DialogTrajectory, base_prompt_override: str | None = None, reverse_roles: bool = False):
+    def preprocess_training_inputs(self, trajectory: "DialogTrajectory", base_prompt_override: str | None = None, reverse_roles: bool = False):
         """
         Prepares inputs and labels for Causal LM training.
         The final message is the target while every message before it is context and has the label masked.
@@ -299,7 +301,7 @@ class TransformersModel:
 
         return result
 
-    def generate(self, trajectory: DialogTrajectory, base_prompt_override: Optional[str] = None, use_base_model: bool = False, as_user: bool = False):
+    def generate(self, trajectory: "DialogTrajectory", base_prompt_override: Optional[str] = None, use_base_model: bool = False, as_user: bool = False):
         inputs = self.preprocess_generation_inputs(trajectory, base_prompt_override, as_user)
         
         # Use the adapted model (LoRA or Prompt Tuning) if available and not explicitly disabled
@@ -315,7 +317,7 @@ class TransformersModel:
         generated_text = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)
         return generated_text
 
-    def generate_diverse(self, trajectory: DialogTrajectory, num_samples: int, base_prompt_override: Optional[str] = None, use_base_model: bool = False, as_user: bool = False):
+    def generate_diverse(self, trajectory: "DialogTrajectory", num_samples: int, base_prompt_override: Optional[str] = None, use_base_model: bool = False, as_user: bool = False):
         """
         Generate multiple diverse responses for the same input.
         """

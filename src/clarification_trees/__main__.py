@@ -11,14 +11,27 @@ load_dotenv()
 from clarification_trees.dialog_tree import DialogTree, NodeType
 from clarification_trees.dataset import ClearVQADataset
 from clarification_trees.utils import add_cq_messages, add_answer_messages, add_inference_messages, get_judge_messages, processes_judge_response
-from src.clarification_trees.models.vllm.remote_vllm_model import RemoteVLLMModel
+from clarification_trees.models.vllm.remote_vllm_model import RemoteVLLMModel
 
 app = typer.Typer()
 
-async def _start_clarification_server(clarification_model_cfg: DictConfig, lora_checkpoint_path: Path, clarification_model_gpus: list[int], clarification_model_port: int, clarification_model_log_file: Path, environment_path: Path):
+async def _start_clarification_server(
+    clarification_model_cfg: DictConfig, 
+    lora_checkpoint_path: Path, 
+    clarification_model_gpus: list[int], 
+    clarification_model_gpu_memory_utilization: float,
+    clarification_model_max_lora_rank: int,
+    clarification_model_max_model_len: int,
+    clarification_model_port: int, 
+    clarification_model_log_file: Path, 
+    environment_path: Path
+):
     model = RemoteVLLMModel(
         clarification_model_cfg,
         lora_checkpoint_path,
+        gpu_memory_utilization=clarification_model_gpu_memory_utilization,
+        max_lora_rank=clarification_model_max_lora_rank,
+        max_model_len=clarification_model_max_model_len,
         gpus=clarification_model_gpus,
         port=clarification_model_port,
         log_file=clarification_model_log_file,
@@ -29,10 +42,23 @@ async def _start_clarification_server(clarification_model_cfg: DictConfig, lora_
     print(f"Clarification server started on port {clarification_model_port}")
     return model
 
-async def _start_answer_server(answer_model_cfg: DictConfig, lora_checkpoint_path: Path, answer_model_gpus: list[int], answer_model_port: int, answer_model_log_file: Path, environment_path: Path):
+async def _start_answer_server(
+    answer_model_cfg: DictConfig, 
+    lora_checkpoint_path: Path, 
+    answer_model_gpus: list[int], 
+    answer_model_gpu_memory_utilization: float,
+    answer_model_max_lora_rank: int,
+    answer_model_max_model_len: int,
+    answer_model_port: int, 
+    answer_model_log_file: Path, 
+    environment_path: Path
+):
     model = RemoteVLLMModel(
         answer_model_cfg,
         lora_checkpoint_path,
+        gpu_memory_utilization=answer_model_gpu_memory_utilization,
+        max_lora_rank=answer_model_max_lora_rank,
+        max_model_len=answer_model_max_model_len,
         gpus=answer_model_gpus,
         port=answer_model_port,
         log_file=answer_model_log_file,
@@ -50,6 +76,12 @@ async def _start_servers(cfg: DictConfig, environment_path: Path):
     answer_model_cfg = cfg.answer_model
     clarification_model_gpus = cfg.devices.clarification
     answer_model_gpus = cfg.devices.answer
+    clarification_model_gpu_memory_utilization = cfg.remote_vllm.clarification.gpu_memory_utilization
+    answer_model_gpu_memory_utilization = cfg.remote_vllm.answer.gpu_memory_utilization
+    clarification_model_max_lora_rank = cfg.remote_vllm.clarification.max_lora_rank
+    answer_model_max_lora_rank = cfg.remote_vllm.answer.max_lora_rank
+    clarification_model_max_model_len = cfg.remote_vllm.clarification.max_model_len
+    answer_model_max_model_len = cfg.remote_vllm.answer.max_model_len
     clarification_model_port = cfg.remote_vllm.clarification.port
     answer_model_port = cfg.remote_vllm.answer.port
     clarification_model_log_file = Path(cfg.remote_vllm.clarification.log_file)
@@ -74,6 +106,9 @@ async def _start_servers(cfg: DictConfig, environment_path: Path):
             clarification_model_cfg,
             lora_checkpoint_path,
             clarification_model_gpus,
+            clarification_model_gpu_memory_utilization,
+            clarification_model_max_lora_rank,
+            clarification_model_max_model_len,
             clarification_model_port,
             clarification_model_log_file,
             environment_path
@@ -82,6 +117,9 @@ async def _start_servers(cfg: DictConfig, environment_path: Path):
             answer_model_cfg,
             lora_checkpoint_path,
             answer_model_gpus,
+            answer_model_gpu_memory_utilization,
+            answer_model_max_lora_rank,
+            answer_model_max_model_len,
             answer_model_port,
             answer_model_log_file,
             environment_path
@@ -176,13 +214,16 @@ def test_vllm_server(
                         inference_response=inference_response,
                         cfg=cfg
                     )
-                    scores_response_obj = await answer_model.generate(messages, use_lora=False)
-                    scores_response = scores_response_obj.choices[0].message.content
-                    assert scores_response is not None
-                    reasoning, score = processes_judge_response(scores_response)
+                    scores_response_obj = await answer_model.generate(messages, use_lora=False, n_outputs=10)
+                    all_scores = []
+                    for scores_response_obj in scores_response_obj.choices:
+                        scores_response = scores_response_obj.message.content
+                        assert scores_response is not None
+                        reasoning, score = processes_judge_response(scores_response)
+                        all_scores.append(score)
                     print(typer.style("\n>> Scores:", fg=typer.colors.BRIGHT_GREEN, bold=True))
                     print(f">> Reasoning: {reasoning}")
-                    print(f">> Score: {score}")
+                    print(f">> Score: {all_scores} = {sum(all_scores)/len(all_scores)}")
 
                 # Immediately try to get an inference
                 await _generate_inference_and_scores(tree, clarification_input_node)
@@ -194,7 +235,46 @@ def test_vllm_server(
                     add_cq_messages(messages, cfg=cfg)
                     # print(f"Testing clarification model with messages:\n{messages}")
 
-                    clarification_response_obj = await clarification_model.generate(messages, use_lora=True)
+                    clarification_response_obj = await clarification_model.generate(messages, use_lora=True, logprobs=True)
+                    """
+                    clarification_response_obj.choices[0].logprobs.content
+                    [ChatCompletionTokenLogprob(token='Are', bytes=[65, 114, 101], logprob=-0.007280366960912943, top_logprobs=[]), ChatCompletionTokenLogprob(token=' you', bytes=[32, 121, 111, 117], logprob=-6.425174069590867e-05, top_logprobs=[]), ChatCompletionTokenLogprob(token=' asking', bytes=[32, 97, 115, 107, 105, 110, 103], ...ob=-0.019521024078130722, top_logprobs=[]), ChatCompletionTokenLogprob(token=' about', bytes=[32, 97, 98, 111, 117, 116], logprob=-0.0012260308722034097, top_logprobs=[]), ChatCompletionTokenLogprob(token=' the', bytes=[32, 116, 104, 101], logprob=-0.005262688733637333, top_logprobs=[]), ChatCompletionTokenLogprob(token=' material', bytes=[32, 109, 97, 116, 101, 114, 105,...rob=-0.10020410269498825, top_logprobs=[]), ChatCompletionTokenLogprob(token=' used', bytes=[32, 117, 115, 101, 100], logprob=-1.4465793371200562, top_logprobs=[]), ChatCompletionTokenLogprob(token=' for', bytes=[32, 102, 111, 114], logprob=-0.4144509732723236, top_logprobs=[]), ChatCompletionTokenLogprob(token=' the', bytes=[32, 116, 104, 101], logprob=-0.012757238931953907, top_logprobs=[]), ChatCompletionTokenLogprob(token=' wheels', bytes=[32, 119, 104, 101, 101, 108, 115],...prob=-3.0741353034973145, top_logprobs=[]), ChatCompletionTokenLogprob(token=' on', bytes=[32, 111, 110], logprob=-0.7221264243125916, top_logprobs=[]), ChatCompletionTokenLogprob(token=' this', bytes=[32, 116, 104, 105, 115], logprob=-1.4424560070037842, top_logprobs=[]), ChatCompletionTokenLogprob(token=' truck', bytes=[32, 116, 114, 117, 99, 107], logprob=-0.6343551278114319, top_logprobs=[]), ChatCompletionTokenLogprob(token='?', bytes=[63], logprob=-0.21069929003715515, top_logprobs=[]), ChatCompletionTokenLogprob(token='<|im_end|>', bytes=[60, 124, 105, 109, 95, 101, 110...b=-4.911301948595792e-05, top_logprobs=[])]
+                    special variables:
+                    function variables:
+                    00: ChatCompletionTokenLogprob(token='Are', bytes=[65, 114, 101], logprob=-0.007280366960912943, top_logprobs=[])
+                    special variables:
+                    function variables:
+                    bytes: [65, 114, 101]
+                    logprob: -0.007280366960912943
+                    model_computed_fields: {}
+                    model_config: {'extra': 'allow', 'defer_build': True}
+                    model_extra: {}
+                    model_fields: {'token': FieldInfo(annotation=str, required=True), 'bytes': FieldInfo(annotation=Union[List[int], NoneType], required=False, default=None), 'logprob': FieldInfo(annotation=float, required=True), 'top_logprobs': FieldInfo(annotation=List[TopLogprob], required=True)}
+                    model_fields_set: {'top_logprobs', 'bytes', 'logprob', 'token'}
+                    token: 'Are'
+                    top_logprobs: []
+                    _abc_impl: <_abc._abc_data object at 0x7a2ef7452940>
+                    _calculate_keys: <bound method BaseModel._calculate_keys of ChatCompletionTokenLogprob(token='Are', bytes=[65, 114, 101], logprob=-0.007280366960912943, top_logprobs=[])>
+                    _copy_and_set_values: <bound method BaseModel._copy_and_set_values of ChatCompletionTokenLogprob(token='Are', bytes=[65, 114, 101], logprob=-0.007280366960912943, top_logprobs=[])>
+                    _get_value: <bound method BaseModel._get_value of <class 'openai.types.chat.chat_completion_token_logprob.ChatCompletionTokenLogprob'>>
+                    _iter: <bound method BaseModel._iter of ChatCompletionTokenLogprob(token='Are', bytes=[65, 114, 101], logprob=-0.007280366960912943, top_logprobs=[])>
+                    _setattr_handler: <bound method BaseModel._setattr_handler of ChatCompletionTokenLogprob(token='Are', bytes=[65, 114, 101], logprob=-0.007280366960912943, top_logprobs=[])>
+                    01: ChatCompletionTokenLogprob(token=' you', bytes=[32, 121, 111, 117], logprob=-6.425174069590867e-05, top_logprobs=[])
+                    02: ChatCompletionTokenLogprob(token=' asking', bytes=[32, 97, 115, 107, 105, 110, 103], logprob=-0.019521024078130722, top_logprobs=[])
+                    03: ChatCompletionTokenLogprob(token=' about', bytes=[32, 97, 98, 111, 117, 116], logprob=-0.0012260308722034097, top_logprobs=[])
+                    04: ChatCompletionTokenLogprob(token=' the', bytes=[32, 116, 104, 101], logprob=-0.005262688733637333, top_logprobs=[])
+                    05: ChatCompletionTokenLogprob(token=' material', bytes=[32, 109, 97, 116, 101, 114, 105, 97, 108], logprob=-0.10020410269498825, top_logprobs=[])
+                    06: ChatCompletionTokenLogprob(token=' used', bytes=[32, 117, 115, 101, 100], logprob=-1.4465793371200562, top_logprobs=[])
+                    07: ChatCompletionTokenLogprob(token=' for', bytes=[32, 102, 111, 114], logprob=-0.4144509732723236, top_logprobs=[])
+                    08: ChatCompletionTokenLogprob(token=' the', bytes=[32, 116, 104, 101], logprob=-0.012757238931953907, top_logprobs=[])
+                    09: ChatCompletionTokenLogprob(token=' wheels', bytes=[32, 119, 104, 101, 101, 108, 115], logprob=-3.0741353034973145, top_logprobs=[])
+                    10: ChatCompletionTokenLogprob(token=' on', bytes=[32, 111, 110], logprob=-0.7221264243125916, top_logprobs=[])
+                    11: ChatCompletionTokenLogprob(token=' this', bytes=[32, 116, 104, 105, 115], logprob=-1.4424560070037842, top_logprobs=[])
+                    12: ChatCompletionTokenLogprob(token=' truck', bytes=[32, 116, 114, 117, 99, 107], logprob=-0.6343551278114319, top_logprobs=[])
+                    13: ChatCompletionTokenLogprob(token='?', bytes=[63], logprob=-0.21069929003715515, top_logprobs=[])
+                    14: ChatCompletionTokenLogprob(token='<|im_end|>', bytes=[60, 124, 105, 109, 95, 101, 110, 100, 124, 62], logprob=-4.911301948595792e-05, top_logprobs=[])
+                    len(): 15
+                    """
                     clarification_response = clarification_response_obj.choices[0].message.content
                     assert clarification_response is not None
                     print(typer.style("\nClarification Response:", fg=typer.colors.RED, bold=True))

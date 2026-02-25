@@ -59,6 +59,7 @@ inference_instruction_prompt: > # User prompt before assistant generation when g
   Be short and concise. Answers should be a couple of words only.
 
 judge_prompts:
+  n_judgements: 5  # Number of times to run the judge per inference. Final score is average.
   base_prompt: |
     You are an expert evaluator for a Visual Question Answering (VQA) system. Your task is to score how well a machine-generated "Inference Response" answers a specific "Unambiguous Question" given a "Gold Answer" and context.
 
@@ -81,7 +82,7 @@ judge_prompts:
     Gold Answer: glass
     Image Caption: a blue and white truck parked next to a crowd of people
     Inference Response: Metal and paint.
-    Evaluation: The response "Metal and paint" is factually incorrect regarding the "clear circles" (headlights/windows).
+    Reasoning: Neither metal nor paint are correct or equivalent to glass.
     Score: 0
 
     Example 2:
@@ -89,7 +90,7 @@ judge_prompts:
     Gold Answer: glass
     Image Caption: a blue and white truck parked next to a crowd of people
     Inference Response: Glass and metal.
-    Evaluation: The response includes "Glass" (correct) but adds "metal" (incorrect for the clear circles). It is partially correct but includes a distractor.
+    Reasoning: Glass is correct, but metal is incorrect.
     Score: 5
 
     Example 3:
@@ -97,7 +98,7 @@ judge_prompts:
     Gold Answer: over eyes
     Image Caption: a man posing with a child on skis
     Inference Response: On their heads, above eyes.
-    Evaluation: "On their heads, above eyes" describes the same position as "over eyes" (goggles on forehead). The meaning is equivalent.
+    Reasoning: Answer is equivalent to correct answer
     Score: 10
 
     Example 4:
@@ -105,7 +106,7 @@ judge_prompts:
     Gold Answer: zebra
     Image Caption: a giraffe standing in the middle of a lush green field
     Inference Response: Giraffe
-    Evaluation: The model answered "Giraffe" which is present in the image but is NOT the animal in front of the white structure (which is a zebra). This is a wrong answer to the specific question.
+    Reasoning: The giraffe is present, but not in front of the white structure
     Score: 0
   
   instruction_prompt: |
@@ -117,7 +118,7 @@ judge_prompts:
     Inference Response: {inference_response}
 
     **Output Format:**
-    Reasoning: [One sentence explaining the judgment]
+    Reasoning: [One very short sentence explaining the judgement. Maximum 10 words]
     Score: [0-10]
 
 
