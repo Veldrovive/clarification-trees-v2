@@ -21,22 +21,22 @@ dialog_tree:
   # There being multiple answers often indicates that the model is trying to give away the answer.
 
 devices:
-  # clarification: [4,5]
-  # answer: [6,7]
-  clarification: [0]
-  answer: [1]
-  semantic_cluster: [0]
+  clarification: [4,5]
+  answer: [6,7]
+  # clarification: [0]
+  # answer: [1]
+  semantic_cluster: [3]
 
 remote_vllm:
   clarification:
     port: 29002
-    gpu_memory_utilization: 0.95
+    gpu_memory_utilization: 0.90
     max_lora_rank: 16
     max_model_len: 4096  #8192
     log_file: "clarification_vllm_remote.log"
   answer:
     port: 29003
-    gpu_memory_utilization: 0.95
+    gpu_memory_utilization: 0.90
     max_lora_rank: 16
     max_model_len: 4096  #8192
     log_file: "answer_vllm_remote.log"

@@ -267,9 +267,11 @@ class TreeSidecar:
     """
     def __init__(self, tree_path: Path, cfg: DictConfig, inference_score_range: tuple[int, int] = (0, 10)):
         self.tree_path = tree_path
-        assert tree_path.exists()
+        # assert tree_path.exists()
         self.cfg = cfg
         self.inference_score_range = inference_score_range
+
+        self.token_logprobs: dict[int, list[tuple[int, float]]] = {}  # Maps node index to list of token IDs and their log-probabilities
 
         self.inference_scores: dict[int, float] = {}
         self.inference_scores_raw: dict[int, list[int]] = {}
@@ -282,6 +284,9 @@ class TreeSidecar:
         self.defer_reward_cache: dict[int, float] = {}
 
         self.advantage_cache: dict[int, float] = {}
+
+    def add_logprobs(self, node_id: int, logprobs: list[tuple[int, float]]):
+        self.token_logprobs[node_id] = logprobs
 
     async def _compute_inference_scores(self, tree: DialogTree, answer_model: RemoteVLLMModel):
         """
@@ -532,7 +537,8 @@ class TreeSidecar:
             "inference_scores": self.inference_scores,
             "inference_scores_raw": self.inference_scores_raw,
             "question_presence_costs": self.question_presence_costs,
-            "entailment_costs": self.entailment_costs
+            "entailment_costs": self.entailment_costs,
+            "token_logprobs": self.token_logprobs
         }
         with open(output_path, "w") as f:
             json.dump(data, f, indent=2)
@@ -548,6 +554,7 @@ class TreeSidecar:
         tree_sidecar.inference_scores_raw = {int(k): v for k, v in data["inference_scores_raw"].items()}
         tree_sidecar.question_presence_costs = {int(k): v for k, v in data["question_presence_costs"].items()}
         tree_sidecar.entailment_costs = {int(k): v for k, v in data["entailment_costs"].items()}
+        tree_sidecar.token_logprobs = {int(k): [tuple(v) for v in vs] for k, vs in data["token_logprobs"].items()}
         return tree_sidecar
 
 def visualize_tree(dialog_tree: DialogTree, tree_sidecar: TreeSidecar | None = None, output_filename: str = "dialog_tree", view: bool = True):

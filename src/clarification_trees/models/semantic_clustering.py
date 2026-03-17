@@ -10,6 +10,7 @@ from sklearn.cluster import AgglomerativeClustering
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import functools
+from typing import Any
 
 class Clusterer(ABC):
     """
@@ -34,11 +35,12 @@ class Clusterer(ABC):
         func = functools.partial(self.cluster, texts)
         return await loop.run_in_executor(self.executor, func)
 
-    def _select_exemplars(self, clusters: List[List[str]], embeddings: np.ndarray = None) -> List[str]:
+    def _select_exemplars(self, clusters: List[List[str]], metadata_clusters: List[List[Any]] = None, embeddings: np.ndarray = None) -> Tuple[List[str], List[Any]]:
         """
         Helper to select the representative 'center' of each cluster based on config.
         """
         exemplars = []
+        metadata_exemplars = []
         
         for i, cluster_texts in enumerate(clusters):
             if not cluster_texts:
@@ -54,16 +56,35 @@ class Clusterer(ABC):
             
             # Fallback methods that don't strictly require embeddings
             if self.exemplar_selection_method == "longest":
-                exemplars.append(max(cluster_texts, key=len))
+                exemplar_idx = np.argmax([len(t) for t in cluster_texts])
+                exemplars.append(cluster_texts[exemplar_idx])
+                if metadata_clusters is not None:
+                    metadata_exemplars.append(metadata_clusters[i][exemplar_idx])
+                else:
+                    metadata_exemplars.append(None)
             elif self.exemplar_selection_method == "shortest":
-                exemplars.append(min(cluster_texts, key=len))
+                exemplar_idx = np.argmin([len(t) for t in cluster_texts])
+                exemplars.append(cluster_texts[exemplar_idx])
+                if metadata_clusters is not None:
+                    metadata_exemplars.append(metadata_clusters[i][exemplar_idx])
+                else:
+                    metadata_exemplars.append(None)
             elif self.exemplar_selection_method == "random" or self.exemplar_selection_method == "first":
-                exemplars.append(cluster_texts[0])
+                exemplar_idx = 0
+                exemplars.append(cluster_texts[exemplar_idx])
+                if metadata_clusters is not None:
+                    metadata_exemplars.append(metadata_clusters[i][exemplar_idx])
+                else:
+                    metadata_exemplars.append(None)
             else:
                 # Default fallback
                 exemplars.append(cluster_texts[0])
+                if metadata_clusters is not None:
+                    metadata_exemplars.append(metadata_clusters[i][0])
+                else:
+                    metadata_exemplars.append(None)
                 
-        return exemplars
+        return exemplars, metadata_exemplars
 
 
 class SemanticClusterer(Clusterer):
@@ -217,7 +238,7 @@ class SlowBidirectionalEntailmentClusterer(Clusterer):
         # 3. Select Exemplars
         # Since we don't have embeddings, "closest_to_mean" is invalid.
         # We fallback to simple heuristics.
-        exemplars = self._select_exemplars(clusters)
+        exemplars, metadata_exemplars = self._select_exemplars(clusters)
         
         return clusters, exemplars
 
@@ -299,13 +320,15 @@ class BidirectionalEntailmentClusterer(Clusterer):
         func = functools.partial(self.compute_biconditional_entailments, statements)
         return await loop.run_in_executor(self.executor, func)
 
-    def cluster(self, texts: List[str]) -> Tuple[List[List[str]], List[str]]:
+    def cluster(self, texts: List[str], metadata: list[Any] | None = None) -> Tuple[List[List[str]], List[str], List[List[Any]], List[Any]]:
         if not texts:
-            return [], []
+            return [], [], [], []
+        if metadata is None:
+            metadata = [None] * len(texts)
             
         n = len(texts)
         if n == 1:
-            return [texts], texts
+            return [texts], texts, [metadata], metadata
 
         # 1. Prepare N^2 inputs (All permutations)
         # We need (A, B) and (B, A) for all pairs to compute the full matrix.
@@ -360,18 +383,20 @@ class BidirectionalEntailmentClusterer(Clusterer):
         labels = clustering.fit_predict(distance_matrix)
 
         # 7. Group Results
-        clusters = [[] for _ in range(max(labels) + 1)]
+        clusters: List[List[str]] = [[] for _ in range(max(labels) + 1)]
+        metadata_clusters: List[List[Any]] = [[] for _ in range(max(labels) + 1)]
         for text_idx, cluster_id in enumerate(labels):
             clusters[cluster_id].append(texts[text_idx])
+            metadata_clusters[cluster_id].append(metadata[text_idx])
 
         # 8. Select Exemplars (e.g., shortest text, or central-most)
-        exemplars = self._select_exemplars(clusters)
+        exemplars, metadata_exemplars = self._select_exemplars(clusters, metadata_clusters)
 
-        return clusters, exemplars
+        return clusters, exemplars, metadata_clusters, metadata_exemplars
 
-    async def async_cluster(self, texts: List[str]) -> Tuple[List[List[str]], List[str]]:
+    async def async_cluster(self, texts: List[str], metadata: list[Any] | None = None) -> Tuple[List[List[str]], List[str], List[List[Any]], List[Any]]:
         loop = asyncio.get_running_loop()
-        func = functools.partial(self.cluster, texts)
+        func = functools.partial(self.cluster, texts, metadata)
         return await loop.run_in_executor(self.executor, func)
 
 class HybridClusterer(Clusterer):
@@ -493,7 +518,7 @@ class HybridClusterer(Clusterer):
         # to support "closest_to_mean" selection if configured.
         # Note: The helper expects numpy array, we have tensor.
         embeddings_np = all_embeddings.cpu().numpy()
-        exemplars = self._select_exemplars(clusters, embeddings=embeddings_np)
+        exemplars, metadata_exemplars = self._select_exemplars(clusters, embeddings=embeddings_np)
         
         return clusters, exemplars
 
@@ -632,7 +657,7 @@ if __name__ == "__main__":
     # It should correctly separate "The sky is blue" from "The ocean is blue" 
     # even if embeddings think they are similar.
     ent_clusterer = BidirectionalEntailmentClusterer(entailment_cfg, device)
-    e_clusters, e_exemplars = ent_clusterer.cluster(test_texts)
+    e_clusters, e_exemplars, _, _ = ent_clusterer.cluster(test_texts)
     
     for i, (cluster, center) in enumerate(zip(e_clusters, e_exemplars)):
         print(f"Cluster {i+1} [Center: '{center}']: {cluster}")

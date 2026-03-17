@@ -50,7 +50,7 @@ inference_base_prompt: | # System prompt for answering the final question based 
 
   Constraints:
   1. You provide a single answer to the user's question.
-  2. You shoudl answer in a few words only.
+  2. You should answer in a few words only.
   3. You must immediately answer the question with no follow-up questions.
 
 inference_instruction_prompt: > # User prompt before assistant generation when generating a final answer

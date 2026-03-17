@@ -228,6 +228,8 @@ def test_vllm_server(
                 # Immediately try to get an inference
                 await _generate_inference_and_scores(tree, clarification_input_node)
 
+                ['vllm', 'serve', 'Qwen/Qwen3-VL-32B-Instruct', '--host', '0.0.0.0', '--port', '29003', '--trust-remote-code', '--tensor-parallel-size', '2', '--max-model-len', '4096', '--gpu-memory-utilization', '0.95', '--allowed-local-media-path', '/', '--enable-lora', '--max-lora-rank', '16']
+
                 for _ in range(5):
                     # Get a clarifying question from the clarification model
                     dialog_traj = tree.get_trajectory(clarification_input_node)
@@ -235,7 +237,7 @@ def test_vllm_server(
                     add_cq_messages(messages, cfg=cfg)
                     # print(f"Testing clarification model with messages:\n{messages}")
 
-                    clarification_response_obj = await clarification_model.generate(messages, use_lora=True, logprobs=True)
+                    clarification_response_obj = await clarification_model.generate(messages, use_lora=True, logprobs=True, use_tokens_as_ids=True)
                     """
                     clarification_response_obj.choices[0].logprobs.content
                     [ChatCompletionTokenLogprob(token='Are', bytes=[65, 114, 101], logprob=-0.007280366960912943, top_logprobs=[]), ChatCompletionTokenLogprob(token=' you', bytes=[32, 121, 111, 117], logprob=-6.425174069590867e-05, top_logprobs=[]), ChatCompletionTokenLogprob(token=' asking', bytes=[32, 97, 115, 107, 105, 110, 103], ...ob=-0.019521024078130722, top_logprobs=[]), ChatCompletionTokenLogprob(token=' about', bytes=[32, 97, 98, 111, 117, 116], logprob=-0.0012260308722034097, top_logprobs=[]), ChatCompletionTokenLogprob(token=' the', bytes=[32, 116, 104, 101], logprob=-0.005262688733637333, top_logprobs=[]), ChatCompletionTokenLogprob(token=' material', bytes=[32, 109, 97, 116, 101, 114, 105,...rob=-0.10020410269498825, top_logprobs=[]), ChatCompletionTokenLogprob(token=' used', bytes=[32, 117, 115, 101, 100], logprob=-1.4465793371200562, top_logprobs=[]), ChatCompletionTokenLogprob(token=' for', bytes=[32, 102, 111, 114], logprob=-0.4144509732723236, top_logprobs=[]), ChatCompletionTokenLogprob(token=' the', bytes=[32, 116, 104, 101], logprob=-0.012757238931953907, top_logprobs=[]), ChatCompletionTokenLogprob(token=' wheels', bytes=[32, 119, 104, 101, 101, 108, 115],...prob=-3.0741353034973145, top_logprobs=[]), ChatCompletionTokenLogprob(token=' on', bytes=[32, 111, 110], logprob=-0.7221264243125916, top_logprobs=[]), ChatCompletionTokenLogprob(token=' this', bytes=[32, 116, 104, 105, 115], logprob=-1.4424560070037842, top_logprobs=[]), ChatCompletionTokenLogprob(token=' truck', bytes=[32, 116, 114, 117, 99, 107], logprob=-0.6343551278114319, top_logprobs=[]), ChatCompletionTokenLogprob(token='?', bytes=[63], logprob=-0.21069929003715515, top_logprobs=[]), ChatCompletionTokenLogprob(token='<|im_end|>', bytes=[60, 124, 105, 109, 95, 101, 110...b=-4.911301948595792e-05, top_logprobs=[])]

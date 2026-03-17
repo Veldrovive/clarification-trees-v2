@@ -11,6 +11,7 @@ from clarification_trees.utils import add_inference_messages
 from clarification_trees.dataset import ClearVQASample
 import asyncio
 import dotenv
+import traceback
 dotenv.load_dotenv()
 
 import hydra
@@ -164,115 +165,124 @@ async def expand_tree(
     sentence_analyzer: SentenceAnalyzer,
     out_dir: Path
 ) -> tuple[Path, Path]:
-    dialog_tree_config = cfg.dialog_tree
-    max_depth = dialog_tree_config.max_depth
-    question_expansion_factor = dialog_tree_config.question_expansion_factor
-    answer_expansion_factor = dialog_tree_config.answer_expansion_factor
-    question_diverse_sample_count = dialog_tree_config.question_diverse_sample_count
-    answer_diverse_sample_count = dialog_tree_config.answer_diverse_sample_count
-    inference_diverse_sample_count = dialog_tree_config.inference_diverse_sample_count
+    try:
+        dialog_tree_config = cfg.dialog_tree
+        max_depth = dialog_tree_config.max_depth
+        question_expansion_factor = dialog_tree_config.question_expansion_factor
+        answer_expansion_factor = dialog_tree_config.answer_expansion_factor
+        question_diverse_sample_count = dialog_tree_config.question_diverse_sample_count
+        answer_diverse_sample_count = dialog_tree_config.answer_diverse_sample_count
+        inference_diverse_sample_count = dialog_tree_config.inference_diverse_sample_count
 
-    dialog_tree_manager = DialogTreeDFSManager(tree, max_depth=max_depth)
+        dialog_tree_manager = DialogTreeDFSManager(tree, max_depth=max_depth)
 
-    cq_node_types = set([NodeType.ROOT, NodeType.CLARIFYING_ANSWER])  # Node types that cause the tree to be expanded using the cq model
-    answer_node_types = set([NodeType.CLARIFICATION_QUESTION])  # Node types that cause the tree to be expanded using the answer model
+        cq_node_types = set([NodeType.ROOT, NodeType.CLARIFYING_ANSWER])  # Node types that cause the tree to be expanded using the cq model
+        answer_node_types = set([NodeType.CLARIFICATION_QUESTION])  # Node types that cause the tree to be expanded using the answer model
 
-    async def _generate_inference(tree: DialogTree, answer_node_ids: list[int], n_outputs: int):
-        with Timer("tree/generate_inference", logger=None):
-            for answer_node_id in answer_node_ids:
-                dialog_trajectory = tree.get_trajectory(answer_node_id)
-                messages = dialog_trajectory.to_messages(model_name="qwen-3-vl", use_img_path=True)
-                add_inference_messages(messages, cfg=cfg)
+        async def _generate_inference(tree: DialogTree, answer_node_ids: list[int], n_outputs: int):
+            with Timer("tree/generate_inference", logger=None):
+                for answer_node_id in answer_node_ids:
+                    dialog_trajectory = tree.get_trajectory(answer_node_id)
+                    messages = dialog_trajectory.to_messages(model_name="qwen-3-vl", use_img_path=True)
+                    add_inference_messages(messages, cfg=cfg)
 
-                with Timer("tree/generate_inference/generate", logger=None):
-                    request_output = await answer_model.generate(messages, n_outputs=n_outputs, use_lora=False)
-                generated_texts = [o.message.content for o in request_output.choices if o.message.content is not None]
-
-                with Timer("tree/generate_inference/cluster", logger=None):
-                    clusters, exemplars = await clusterer.async_cluster(generated_texts)
-
-                probabilities = [len(cluster) / len(generated_texts) for cluster in clusters]
-
-                for exemplar, probability in zip(exemplars, probabilities):
-                    tree.add_node(
-                        parent_idx=answer_node_id,
-                        node_type=NodeType.INFERENCE,
-                        response=exemplar,
-                        transition_prob=probability
-                    )
-
-
-    with Timer("tree", logger=None):
-        # We always start by making an inference from the root node.
-        await _generate_inference(tree, [DialogTree.ROOT], inference_diverse_sample_count)
-        while dialog_tree_manager.has_open_nodes():
-            dialog_trajectory, input_node_type, node_id = dialog_tree_manager.get_next_node()
-            messages = dialog_trajectory.to_messages(model_name="qwen-3-vl", use_img_path=True)
-
-            if input_node_type in cq_node_types:
-                add_cq_messages(messages, cfg=cfg)
-
-                engine = cq_model
-                sample_count = question_diverse_sample_count
-                expansion_factor = question_expansion_factor
-                output_node_type = NodeType.CLARIFICATION_QUESTION
-                use_lora = True
-                timer_key = "generate_cq"
-            elif input_node_type in answer_node_types:
-                assert tree.unambiguous_question is not None
-                assert tree.answers is not None
-                add_answer_messages(messages, unambiguous_question=tree.unambiguous_question, answers=tree.answers, cfg=cfg)
-
-                engine = answer_model
-                sample_count = answer_diverse_sample_count
-                expansion_factor = answer_expansion_factor
-                output_node_type = NodeType.CLARIFYING_ANSWER
-                use_lora = False
-                timer_key = "generate_ca"
-            else:
-                raise ValueError(f"Unknown node type: {input_node_type}")
-
-            with Timer(f"tree/{timer_key}", logger=None):
-                with Timer(f"tree/{timer_key}/generate", logger=None):
-                    # request_output = await engine.generate.remote(vllm_inputs, n_outputs=sample_count, request_id=node_uuid)
-                    request_output = await engine.generate(messages, n_outputs=sample_count, use_lora=use_lora)
+                    with Timer("tree/generate_inference/generate", logger=None):
+                        request_output = await answer_model.generate(messages, n_outputs=n_outputs, use_lora=False)
                     generated_texts = [o.message.content for o in request_output.choices if o.message.content is not None]
 
-                with Timer(f"tree/{timer_key}/cluster", logger=None):
-                    clusters, exemplars = await clusterer.async_cluster(generated_texts)
+                    with Timer("tree/generate_inference/cluster", logger=None):
+                        clusters, exemplars, _, _ = await clusterer.async_cluster(generated_texts)
 
-            # We may have more clusters than the expansion factor allows
-            # If this is the case, we randomly select a subset of the clusters to use
-            # We may also have fewer in which case we use all of them
-            if len(clusters) > expansion_factor:
-                cluster_indices = random.sample(range(len(clusters)), expansion_factor)
-                clusters = [clusters[i] for i in cluster_indices]
-                exemplars = [exemplars[i] for i in cluster_indices]
-            total_allowed_texts = sum([len(cluster) for cluster in clusters])
-            probabilities = [len(cluster) / total_allowed_texts for cluster in clusters]
-            assert np.isclose(sum(probabilities), 1.0)
+                    probabilities = [len(cluster) / len(generated_texts) for cluster in clusters]
 
-            new_node_ids = dialog_tree_manager.add_children(
-                parent_node_id=node_id,
-                new_node_texts=exemplars,
-                new_node_trans_probs=probabilities,
-                output_node_type=output_node_type
-            )
+                    for exemplar, probability in zip(exemplars, probabilities):
+                        tree.add_node(
+                            parent_idx=answer_node_id,
+                            node_type=NodeType.INFERENCE,
+                            response=exemplar,
+                            transition_prob=probability
+                        )
 
-            if output_node_type == NodeType.CLARIFYING_ANSWER:
-                await _generate_inference(tree, new_node_ids, answer_diverse_sample_count)
-    
 
-    tree_save_path = out_dir / f"tree.json"
-    sidecar_save_path = out_dir / f"tree_sidecar.json"
-    tree.save(tree_save_path)
-
-    with Timer("reward", logger=None):
+        tree_save_path = out_dir / f"tree.json"
+        sidecar_save_path = out_dir / f"tree_sidecar.json"
         sidecar = TreeSidecar(tree_save_path, cfg)
-        await sidecar.compute_all_scores(answer_model, sentence_analyzer, clusterer)
-        sidecar.save(sidecar_save_path)
+        with Timer("tree", logger=None):
+            # We always start by making an inference from the root node.
+            await _generate_inference(tree, [DialogTree.ROOT], inference_diverse_sample_count)
+            while dialog_tree_manager.has_open_nodes():
+                dialog_trajectory, input_node_type, node_id = dialog_tree_manager.get_next_node()
+                messages = dialog_trajectory.to_messages(model_name="qwen-3-vl", use_img_path=True)
 
-    return tree_save_path, sidecar_save_path
+                if input_node_type in cq_node_types:
+                    add_cq_messages(messages, cfg=cfg)
+
+                    engine = cq_model
+                    sample_count = question_diverse_sample_count
+                    expansion_factor = question_expansion_factor
+                    output_node_type = NodeType.CLARIFICATION_QUESTION
+                    use_lora = True
+                    timer_key = "generate_cq"
+                elif input_node_type in answer_node_types:
+                    assert tree.unambiguous_question is not None
+                    assert tree.answers is not None
+                    add_answer_messages(messages, unambiguous_question=tree.unambiguous_question, answers=tree.answers, cfg=cfg)
+
+                    engine = answer_model
+                    sample_count = answer_diverse_sample_count
+                    expansion_factor = answer_expansion_factor
+                    output_node_type = NodeType.CLARIFYING_ANSWER
+                    use_lora = False
+                    timer_key = "generate_ca"
+                else:
+                    raise ValueError(f"Unknown node type: {input_node_type}")
+
+                with Timer(f"tree/{timer_key}", logger=None):
+                    with Timer(f"tree/{timer_key}/generate", logger=None):
+                        # request_output = await engine.generate.remote(vllm_inputs, n_outputs=sample_count, request_id=node_uuid)
+                        request_output = await engine.generate(messages, n_outputs=sample_count, use_lora=use_lora, use_tokens_as_ids=True, logprobs=True)
+                        generated_texts = [o.message.content for o in request_output.choices if o.message.content is not None]
+                        generated_logprobs = [[(int(o.token.split(":")[1]), o.logprob) for o in choice.logprobs.content] for choice in request_output.choices]
+
+                    with Timer(f"tree/{timer_key}/cluster", logger=None):
+                        clusters, exemplars, metadata_clusters, metadata_exemplars = await clusterer.async_cluster(generated_texts, generated_logprobs)
+
+                # We may have more clusters than the expansion factor allows
+                # If this is the case, we randomly select a subset of the clusters to use
+                # We may also have fewer in which case we use all of them
+                if len(clusters) > expansion_factor:
+                    cluster_indices = random.sample(range(len(clusters)), expansion_factor)
+                    clusters = [clusters[i] for i in cluster_indices]
+                    exemplars = [exemplars[i] for i in cluster_indices]
+                    metadata_clusters: list[list[list[tuple[int, float]]]] = [metadata_clusters[i] for i in cluster_indices]
+                    metadata_exemplars: list[list[tuple[int, float]]] = [metadata_exemplars[i] for i in cluster_indices]
+                total_allowed_texts = sum([len(cluster) for cluster in clusters])
+                probabilities = [len(cluster) / total_allowed_texts for cluster in clusters]
+                assert np.isclose(sum(probabilities), 1.0)
+
+                new_node_ids = dialog_tree_manager.add_children(
+                    parent_node_id=node_id,
+                    new_node_texts=exemplars,
+                    new_node_trans_probs=probabilities,
+                    output_node_type=output_node_type
+                )
+
+                for new_node_id, metadata_exemplar in zip(new_node_ids, metadata_exemplars):
+                    sidecar.add_logprobs(new_node_id, metadata_exemplar)
+
+                if output_node_type == NodeType.CLARIFYING_ANSWER:
+                    await _generate_inference(tree, new_node_ids, answer_diverse_sample_count)
+        
+        tree.save(tree_save_path)
+        with Timer("reward", logger=None):
+            await sidecar.compute_all_scores(answer_model, sentence_analyzer, clusterer)
+            sidecar.save(sidecar_save_path)
+
+        return tree_save_path, sidecar_save_path
+    except Exception as e:
+        # print(f"Error generating tree {e}")
+        traceback.print_exc()
+        raise e
 
 
 async def process_dataset_lazily(
