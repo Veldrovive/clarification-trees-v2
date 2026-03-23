@@ -13,6 +13,14 @@
             "args": "test-vllm-server"
         },
         {
+            "name": "Python Debugger: Test RL Training Datapoints",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/clarification_trees/__main__.py",
+            "console": "integratedTerminal",
+            "args": "test-rl-training-datapoints"
+        },
+        {
             "name": "Python Debugger: Visualize Tree",
             "type": "debugpy",
             "request": "launch",

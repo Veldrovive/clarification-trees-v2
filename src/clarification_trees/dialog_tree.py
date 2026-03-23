@@ -11,10 +11,13 @@ import numpy as np
 from omegaconf import DictConfig
 from codetiming import Timer
 import textwrap
+from typing import TYPE_CHECKING
 
-from clarification_trees.utils import get_judge_messages, processes_judge_response, SentenceAnalyzer
-from clarification_trees.models.semantic_clustering import BidirectionalEntailmentClusterer
-from clarification_trees.models.vllm import RemoteVLLMModel
+from clarification_trees.utils import get_judge_messages, processes_judge_response
+if TYPE_CHECKING:
+    from clarification_trees.utils import SentenceAnalyzer
+    from clarification_trees.models.semantic_clustering import BidirectionalEntailmentClusterer
+    from clarification_trees.models.vllm import RemoteVLLMModel
 
 
 class NodeType(Enum):
@@ -288,7 +291,7 @@ class TreeSidecar:
     def add_logprobs(self, node_id: int, logprobs: list[tuple[int, float]]):
         self.token_logprobs[node_id] = logprobs
 
-    async def _compute_inference_scores(self, tree: DialogTree, answer_model: RemoteVLLMModel):
+    async def _compute_inference_scores(self, tree: DialogTree, answer_model: "RemoteVLLMModel"):
         """
         Crawl the tree looking for inference nodes and compute the reward for each.
         """
@@ -334,7 +337,7 @@ class TreeSidecar:
 
                 inference_score_cache[inference] = (normed_score, scores)
 
-    async def _compute_question_presence_costs(self, tree: DialogTree, sentence_analyzer: SentenceAnalyzer):
+    async def _compute_question_presence_costs(self, tree: DialogTree, sentence_analyzer: "SentenceAnalyzer"):
         """
         Checks all clarifying questions in the tree to make sure they contain a question and not too many sentences.
         A question + with at most 2 sentences gets a score of 1.
@@ -370,7 +373,7 @@ class TreeSidecar:
             cost -= n_long_sentences * 0.15
             self.question_presence_costs[node_id] = cost
 
-    async def _compute_entailment_costs(self, tree: DialogTree, clusterer: BidirectionalEntailmentClusterer):
+    async def _compute_entailment_costs(self, tree: DialogTree, clusterer: "BidirectionalEntailmentClusterer"):
         """
         Used to supress redundant questions. For each clarifying question we check if it is entailed by any previous question in the branch.
         """
@@ -417,7 +420,7 @@ class TreeSidecar:
 
         self.entailment_costs = entailment_costs
 
-    async def compute_all_scores(self, answer_model: RemoteVLLMModel, sentence_analyzer: SentenceAnalyzer, clusterer: BidirectionalEntailmentClusterer):
+    async def compute_all_scores(self, answer_model: "RemoteVLLMModel", sentence_analyzer: "SentenceAnalyzer", clusterer: "BidirectionalEntailmentClusterer"):
         tree = DialogTree.load(self.tree_path)
         with Timer("reward/inference_score", logger=None):
             await self._compute_inference_scores(tree, answer_model)
@@ -530,6 +533,18 @@ class TreeSidecar:
         self._compute_reward_recursive(tree, rewards, DialogTree.ROOT)
         self.reward_cache = rewards
         self.advantage_cache = self._compute_advantage(tree, rewards)
+
+    def get_node_advantage(self, node_idx: int) -> float:
+        # Check if the advantage cache has been computed
+        if node_idx not in self.advantage_cache:
+            self.compute_rewards()
+        return self.advantage_cache[node_idx]
+
+    def get_node_logprobs(self, node_idx: int) -> list[tuple[int, float]]:
+        # Check if the logprobs cache has been computed
+        if node_idx not in self.token_logprobs:
+            raise ValueError(f"Logprobs for node {node_idx} not found. Please ensure node is for the correct tree and sidecar is not malformed.")
+        return self.token_logprobs[node_idx]
 
     def save(self, output_path: Path):
         data = {

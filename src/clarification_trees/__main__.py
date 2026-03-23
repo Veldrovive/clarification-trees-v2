@@ -8,9 +8,10 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 load_dotenv()
 
-from clarification_trees.dialog_tree import DialogTree, NodeType
+from clarification_trees.dialog_tree import DialogTree, NodeType, TreeSidecar
 from clarification_trees.dataset import ClearVQADataset
 from clarification_trees.utils import add_cq_messages, add_answer_messages, add_inference_messages, get_judge_messages, processes_judge_response
+from clarification_trees import utils
 from clarification_trees.models.vllm.remote_vllm_model import RemoteVLLMModel
 
 app = typer.Typer()
@@ -317,7 +318,49 @@ def test_vllm_server(
     asyncio.run(test_servers())
 
     
+@app.command()
+def test_rl_training_datapoints(
+    ctx: typer.Context,
+    config_name: str = typer.Option("config", help="Name of the config file to use")
+):
+    from clarification_trees.models import TransformersModelV2
+    with initialize(version_base=None, config_path="config"):
+        cfg = compose(config_name=config_name, overrides=ctx.args)
 
+    print("Loading tree")
+    test_tree_path = Path("/scratch4/home/adempst/projects/clarification-trees-v2/data/trees/tree_val_000000_11d26793-a53b-456c-add5-0d51abdea743.json")
+    tree = DialogTree.load(test_tree_path / "tree.json")
+    sidecar = TreeSidecar.load(test_tree_path / "tree_sidecar.json", cfg)
+
+    print("Loading model")
+    model = TransformersModelV2(cfg.clarification_model, device="cuda:7")
+
+    print("Generating datapoints")
+    datapoints, max_advantage, min_advantage = model.preprocess_rl_training_inputs(0, tree, sidecar, "user")
+    print(f"Generated {len(datapoints)} datapoints.")
+    for i, dp in enumerate(datapoints):
+        print(f"Datapoint {i}: {dp}")
+
+    for i, dp in enumerate(datapoints):
+        print(f"\n\nDatapoint {i}")
+        print(f"Datapoint string: {utils.tokens_to_str(dp.tokens, model.processor.tokenizer)}")
+
+        # Mask out just the tokens with dp.action_mask == 1 so that we can see what part of the datapoint is the "action"
+        masked_tokens: list[int] = []
+        for j in range(len(dp.tokens)):
+            if dp.action_mask[j] == 1:
+                masked_tokens.append(dp.tokens[j])
+        print(f"Masked tokens: {utils.tokens_to_str_list(masked_tokens, model.processor.tokenizer)}")
+    
+    print(f"Max advantage: {max_advantage}, Min advantage: {min_advantage}")
+    print(f"Advantage range: {max_advantage - min_advantage}")
+    
+
+
+
+    
+    
+    
 
 if __name__ == "__main__":
     # ignore_unknown_options=True allows us to pass Hydra overrides (like db.host=...)

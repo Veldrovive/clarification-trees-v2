@@ -2,6 +2,7 @@ from omegaconf import DictConfig
 from pathlib import Path
 
 from .transformers_model import TransformersModel
+from .transformers_model_v2 import TransformersModelV2
 from .semantic_clustering import SemanticClusterer, BidirectionalEntailmentClusterer, HybridClusterer, Clusterer
 
 def construct_model(model_config: DictConfig, device: str, load_lora: bool = True, loras_path: Path | None = None, allow_quantization: bool = True) -> TransformersModel:

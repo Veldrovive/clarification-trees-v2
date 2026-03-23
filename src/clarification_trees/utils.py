@@ -1,3 +1,4 @@
+from typing import Iterable, TYPE_CHECKING
 from omegaconf import DictConfig
 import os
 import sys
@@ -10,6 +11,9 @@ import re
 from typing import Any
 import spacy
 from dataclasses import dataclass
+
+if TYPE_CHECKING:
+    import transformers
 
 class SentenceAnalyzer:
     @dataclass
@@ -263,3 +267,12 @@ def processes_judge_response(response: str) -> tuple[str, int]:
     score = int(score_match.group(1)) if score_match else -1
 
     return reasoning, score
+
+def tokens_to_str(tokens: list[int], tokenizer: "transformers.PreTrainedTokenizer") -> str:
+    return tokenizer.decode(tokens, skip_special_tokens=True)
+
+def tokens_to_str_list(tokens: list[int], tokenizer: "transformers.PreTrainedTokenizer") -> list[str]:
+    id_to_token_map = {v: k for k, v in tokenizer.get_vocab().items()}
+    id_to_token_map[-100] = "<mask>"
+    return [id_to_token_map.get(int(id), "<unk>") for id in tokens]
+    
